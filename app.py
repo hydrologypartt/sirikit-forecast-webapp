@@ -37,6 +37,7 @@ STATIONS = [("N1", "N.1"), ("N13A", "N.13A"), ("N64", "N.64")]
 # ---------------------------------------------------------------------------
 # ฟังก์ชันช่วยเตรียมข้อมูลสำหรับโมเดล (รวม reservoir + station)
 # ---------------------------------------------------------------------------
+@st.cache_data(ttl=300, show_spinner="กำลังเตรียมข้อมูลสำหรับโมเดล...")
 def build_model_ready_df():
     res = data_io.load_all_reservoir_snapshots()
     if res.empty:
@@ -165,6 +166,8 @@ def page_forecast():
         with st.spinner("กำลังเทรนโมเดล 7 ตัว (1 ตัวต่อ 1 วันล่วงหน้า)..."):
             models, metrics, feature_cols, use_rainfall = model_module.train_all_horizons(df)
             model_module.save_models_to_storage(models, feature_cols, use_rainfall)
+            # โมเดลบน disk/Drive เปลี่ยนแล้ว ต้องล้าง cache ของตัวโหลดโมเดล
+            model_module.load_models_from_storage.clear()
         st.success("เทรนโมเดลใหม่เสร็จแล้ว" + (" (รวมข้อมูลฝนเป็น feature ด้วยแล้ว)" if use_rainfall else ""))
         st.dataframe(metrics.style.format({"mae": "{:.2f}", "rmse": "{:.2f}", "r2": "{:.3f}"}))
         if not use_rainfall and "rainfall" in df.columns:
@@ -669,12 +672,26 @@ if data_io.storage_mode() == "local":
 else:
     st.sidebar.success("✅ เชื่อมต่อ Google Drive แล้ว")
 
-tab1, tab2, tab3, tab4 = st.tabs(["📈 พยากรณ์", "📤 อัปโหลดข้อมูลใหม่", "🗂️ ประวัติ", "📊 กราฟสรุป"])
-with tab1:
-    page_forecast()
-with tab2:
-    page_upload()
-with tab3:
-    page_history()
-with tab4:
-    page_dashboard()
+# ใช้ lazy loading: Streamlit จะรันเฉพาะแท็บที่กำลังเปิดอยู่
+# ช่วยลดเวลารอ เพราะแต่ละหน้ามีการอ่าน/ประมวลผลข้อมูลหลายชุด
+tab1, tab2, tab3, tab4 = st.tabs(
+    ["📈 พยากรณ์", "📤 อัปโหลดข้อมูลใหม่", "🗂️ ประวัติ", "📊 กราฟสรุป"],
+    on_change="rerun",
+    key="main_tabs",
+)
+
+if tab1.open:
+    with tab1:
+        page_forecast()
+
+if tab2.open:
+    with tab2:
+        page_upload()
+
+if tab3.open:
+    with tab3:
+        page_history()
+
+if tab4.open:
+    with tab4:
+        page_dashboard()
