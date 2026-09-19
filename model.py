@@ -12,6 +12,7 @@ import io
 import joblib
 import numpy as np
 import pandas as pd
+import streamlit as st
 from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
@@ -72,6 +73,7 @@ def save_models_to_storage(models: dict, feature_cols: list, use_rainfall: bool)
     data_io.save_models(buf.getvalue())
 
 
+@st.cache_resource(show_spinner="กำลังโหลดโมเดลพยากรณ์...")
 def load_models_from_storage():
     raw = data_io.load_models_bytes()
     if raw is None:
