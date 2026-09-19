@@ -163,11 +163,25 @@ def page_forecast():
         run_forecast = st.button("▶️ รันพยากรณ์ด้วยโมเดลปัจจุบัน", type="primary")
 
     if retrain:
-        with st.spinner("กำลังเทรนโมเดล 7 ตัว (1 ตัวต่อ 1 วันล่วงหน้า)..."):
-            models, metrics, feature_cols, use_rainfall = model_module.train_all_horizons(df)
-            model_module.save_models_to_storage(models, feature_cols, use_rainfall)
-            # โมเดลบน disk/Drive เปลี่ยนแล้ว ต้องล้าง cache ของตัวโหลดโมเดล
-            model_module.load_models_from_storage.clear()
+        # แสดงความคืบหน้าเป็นราย horizon เพื่อให้ผู้ใช้เห็นว่าแอปยังทำงานอยู่
+        progress = st.progress(0, text="กำลังเตรียมเทรนโมเดล 7 ตัว...")
+        status = st.empty()
+
+        def _on_train_progress(h, total, model):
+            progress.progress(h / total, text=f"กำลังเทรนโมเดล {h}/{total} — Day +{h}")
+            status.caption(
+                f"Day +{h} เสร็จแล้ว • ใช้จริง {getattr(model, 'n_iter_', '-')} รอบจากสูงสุด {model_module.MODEL_PARAMS['max_iter']} รอบ"
+            )
+
+        models, metrics, feature_cols, use_rainfall = model_module.train_all_horizons(
+            df, progress_callback=_on_train_progress
+        )
+        model_module.save_models_to_storage(models, feature_cols, use_rainfall)
+        # โมเดลบน disk/Drive เปลี่ยนแล้ว ต้องล้าง cache ของตัวโหลดโมเดล
+        model_module.load_models_from_storage.clear()
+        progress.progress(1.0, text="เทรนโมเดลทั้ง 7 ตัวเสร็จแล้ว")
+        status.empty()
+
         st.success("เทรนโมเดลใหม่เสร็จแล้ว" + (" (รวมข้อมูลฝนเป็น feature ด้วยแล้ว)" if use_rainfall else ""))
         st.dataframe(metrics.style.format({"mae": "{:.2f}", "rmse": "{:.2f}", "r2": "{:.3f}"}))
         if not use_rainfall and "rainfall" in df.columns:
