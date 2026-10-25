@@ -240,8 +240,9 @@ def save_reservoir_bulk(df: pd.DataFrame):
 
 
 def save_station_snapshot(df_new_rows: pd.DataFrame):
-    """บันทึกข้อมูลสถานีน้ำท่าที่กรอกเองรายวัน (ระดับน้ำ + ปริมาณน้ำ ของ N1/N13A/N64)
-    df_new_rows ต้องมีคอลัมน์: date, N1_level, N1_Q, N13A_level, N13A_Q, N64_level, N64_Q"""
+    """บันทึกข้อมูลสถานีน้ำท่าที่กรอกเองรายวัน (เฉพาะปริมาณน้ำ Q ของ N1/N13A/N64)
+    df_new_rows ต้องมีคอลัมน์: date, N1_Q, N13A_Q, N64_Q
+    (ไฟล์เก่าที่เคยบันทึกคอลัมน์ *_level ไว้ยังโหลดได้ปกติ แต่ไม่ถูกนำไปใช้)"""
     for _, row in df_new_rows.iterrows():
         date_str = pd.to_datetime(row["date"]).strftime("%Y-%m-%d")
         filename = f"stationQ_{date_str}.csv"
@@ -258,7 +259,7 @@ def save_station_snapshot(df_new_rows: pd.DataFrame):
 def load_all_station_snapshots() -> pd.DataFrame:
     """โหลดข้อมูลสถานีน้ำท่าที่กรอกเองรายวันทั้งหมด รวมเป็น DataFrame เดียว"""
     frames = []
-    cols = ["date", "N1_level", "N1_Q", "N13A_level", "N13A_Q", "N64_level", "N64_Q"]
+    cols = ["date", "N1_Q", "N13A_Q", "N64_Q"]
     if storage_mode() == "drive":
         for f in _drive_list_filenames(prefix="stationQ_"):
             frames.append(pd.read_csv(io.BytesIO(_drive_download(f["id"]))))
@@ -397,3 +398,77 @@ def load_all_forecast_logs() -> pd.DataFrame:
     if not frames:
         return pd.DataFrame()
     return pd.concat(frames, ignore_index=True).sort_values("run_date").reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------------
+# ค่าปรับ Baseflow รายวัน (หลังบ้าน — แก้ได้เฉพาะผู้ดูแลที่ล็อกอิน)
+# ---------------------------------------------------------------------------
+BASEFLOW_FILE = "baseflow_adjust.csv"
+BASEFLOW_COLS = ["date", "adj_cms", "note", "updated_by", "updated_at"]
+
+
+def save_baseflow_adjustments(df: pd.DataFrame):
+    """เก็บค่าปรับ Baseflow ทั้งหมดไว้ไฟล์เดียว (เขียนทับทั้งไฟล์ทุกครั้งที่บันทึก)
+    df ต้องมีคอลัมน์: date, adj_cms (ลบ.ม./วิ), note, updated_by, updated_at"""
+    df_out = df.reindex(columns=BASEFLOW_COLS).copy()
+    df_out["date"] = pd.to_datetime(df_out["date"]).dt.strftime("%Y-%m-%d")
+    content = df_out.to_csv(index=False).encode("utf-8")
+    if storage_mode() == "drive":
+        _drive_upload(BASEFLOW_FILE, content)
+    else:
+        os.makedirs(LOCAL_DATA_DIR, exist_ok=True)
+        with open(os.path.join(LOCAL_DATA_DIR, BASEFLOW_FILE), "wb") as f:
+            f.write(content)
+
+
+@st.cache_data(ttl=60)
+def load_baseflow_adjustments() -> pd.DataFrame:
+    """โหลดค่าปรับ Baseflow ล่าสุด — คืนค่า DataFrame ว่าง (มีหัวคอลัมน์ครบ) ถ้ายังไม่เคยบันทึก"""
+    if storage_mode() == "drive":
+        matches = [f for f in _drive_list_filenames(prefix=BASEFLOW_FILE) if f["name"] == BASEFLOW_FILE]
+        if not matches:
+            return pd.DataFrame(columns=BASEFLOW_COLS)
+        content = _drive_download(matches[0]["id"])
+    else:
+        path = os.path.join(LOCAL_DATA_DIR, BASEFLOW_FILE)
+        if not os.path.exists(path):
+            return pd.DataFrame(columns=BASEFLOW_COLS)
+        with open(path, "rb") as f:
+            content = f.read()
+    df = pd.read_csv(io.BytesIO(content))
+    if df.empty:
+        return pd.DataFrame(columns=BASEFLOW_COLS)
+    df["date"] = pd.to_datetime(df["date"])
+    df["adj_cms"] = pd.to_numeric(df["adj_cms"], errors="coerce").fillna(0.0)
+    return df.reindex(columns=BASEFLOW_COLS)
+
+
+def save_baseflow_audit(df_rows: pd.DataFrame):
+    """เก็บบันทึกการแก้ไขทุกครั้ง (แยกไฟล์ต่อครั้ง ไม่เขียนทับ) ไว้ย้อนดูว่าใครปรับอะไรเมื่อไหร่"""
+    ts = datetime.datetime.now().strftime("%Y%m%d%H%M%S%f")
+    filename = f"baseflowlog_{ts}.csv"
+    df_out = df_rows.reindex(columns=BASEFLOW_COLS).copy()
+    df_out["date"] = pd.to_datetime(df_out["date"]).dt.strftime("%Y-%m-%d")
+    content = df_out.to_csv(index=False).encode("utf-8")
+    if storage_mode() == "drive":
+        _drive_upload(filename, content)
+    else:
+        os.makedirs(LOCAL_DATA_DIR, exist_ok=True)
+        with open(os.path.join(LOCAL_DATA_DIR, filename), "wb") as f:
+            f.write(content)
+
+
+@st.cache_data(ttl=60)
+def load_baseflow_audit() -> pd.DataFrame:
+    frames = []
+    if storage_mode() == "drive":
+        for f in _drive_list_filenames(prefix="baseflowlog_"):
+            frames.append(pd.read_csv(io.BytesIO(_drive_download(f["id"]))))
+    else:
+        os.makedirs(LOCAL_DATA_DIR, exist_ok=True)
+        for path in glob.glob(os.path.join(LOCAL_DATA_DIR, "baseflowlog_*.csv")):
+            frames.append(pd.read_csv(path))
+    if not frames:
+        return pd.DataFrame(columns=BASEFLOW_COLS)
+    df = pd.concat(frames, ignore_index=True)
+    return df.sort_values("updated_at", ascending=False).reset_index(drop=True)

@@ -15,6 +15,7 @@ from station_parser import parse_station_file, parse_station_excel, cms_to_mcm_p
 from reservoir_parser import parse_reservoir_excel
 from hyd_parser import parse_hyd_workbook
 import report as report_module
+import baseflow as baseflow_module
 from rain_forecast_parser import parse_rainfall_forecast_excel
 import rainfall as rainfall_module
 from shp_reader import read_shapefile_polygons  # noqa: F401 (ใช้ตรวจสอบไฟล์ตอนอัปโหลด)
@@ -37,7 +38,6 @@ STATIONS = [("N1", "N.1"), ("N13A", "N.13A"), ("N64", "N.64")]
 # ---------------------------------------------------------------------------
 # ฟังก์ชันช่วยเตรียมข้อมูลสำหรับโมเดล (รวม reservoir + station)
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=300, show_spinner="กำลังเตรียมข้อมูลสำหรับโมเดล...")
 def build_model_ready_df():
     res = data_io.load_all_reservoir_snapshots()
     if res.empty:
@@ -163,25 +163,9 @@ def page_forecast():
         run_forecast = st.button("▶️ รันพยากรณ์ด้วยโมเดลปัจจุบัน", type="primary")
 
     if retrain:
-        # แสดงความคืบหน้าเป็นราย horizon เพื่อให้ผู้ใช้เห็นว่าแอปยังทำงานอยู่
-        progress = st.progress(0, text="กำลังเตรียมเทรนโมเดล 7 ตัว...")
-        status = st.empty()
-
-        def _on_train_progress(h, total, model):
-            progress.progress(h / total, text=f"กำลังเทรนโมเดล {h}/{total} — Day +{h}")
-            status.caption(
-                f"Day +{h} เสร็จแล้ว • ใช้จริง {getattr(model, 'n_iter_', '-')} รอบจากสูงสุด {model_module.MODEL_PARAMS['max_iter']} รอบ"
-            )
-
-        models, metrics, feature_cols, use_rainfall = model_module.train_all_horizons(
-            df, progress_callback=_on_train_progress
-        )
-        model_module.save_models_to_storage(models, feature_cols, use_rainfall)
-        # โมเดลบน disk/Drive เปลี่ยนแล้ว ต้องล้าง cache ของตัวโหลดโมเดล
-        model_module.load_models_from_storage.clear()
-        progress.progress(1.0, text="เทรนโมเดลทั้ง 7 ตัวเสร็จแล้ว")
-        status.empty()
-
+        with st.spinner("กำลังเทรนโมเดล 7 ตัว (1 ตัวต่อ 1 วันล่วงหน้า)..."):
+            models, metrics, feature_cols, use_rainfall = model_module.train_all_horizons(df)
+            model_module.save_models_to_storage(models, feature_cols, use_rainfall)
         st.success("เทรนโมเดลใหม่เสร็จแล้ว" + (" (รวมข้อมูลฝนเป็น feature ด้วยแล้ว)" if use_rainfall else ""))
         st.dataframe(metrics.style.format({"mae": "{:.2f}", "rmse": "{:.2f}", "r2": "{:.3f}"}))
         if not use_rainfall and "rainfall" in df.columns:
@@ -207,11 +191,29 @@ def page_forecast():
             return
         forecast_dates = forecast_dates_preview
 
+        # log เก็บผลดิบจากโมเดลเสมอ (ไม่รวมค่าปรับ) เพื่อใช้ประเมินความแม่นของโมเดลภายหลัง
         data_io.save_forecast_log(last_date.date(), preds)
 
-        chart_df = pd.DataFrame({"วันที่": [d.strftime("%d %b") for d in forecast_dates], "พยากรณ์ (ล้าน ลบ.ม./วัน)": preds})
-        st.line_chart(chart_df.set_index("วันที่"))
-        st.dataframe(chart_df, use_container_width=True, hide_index=True)
+        preds_adj, adj_mcm = baseflow_module.apply_adjustment(preds, forecast_dates)
+        day_labels = [d.strftime("%d %b") for d in forecast_dates]
+        if baseflow_module.has_adjustment(adj_mcm):
+            chart_df = pd.DataFrame({
+                "วันที่": day_labels,
+                "โมเดล (ล้าน ลบ.ม./วัน)": preds,
+                "ปรับ Baseflow แล้ว (ล้าน ลบ.ม./วัน)": preds_adj,
+            })
+            st.line_chart(chart_df.set_index("วันที่"))
+            table_adj = chart_df.copy()
+            table_adj["ส่วนที่ปรับ (ล้าน ลบ.ม./วัน)"] = adj_mcm
+            st.dataframe(table_adj.round(2), use_container_width=True, hide_index=True)
+            st.info(
+                "🔧 ผลพยากรณ์ด้านบนมีการปรับค่า Baseflow เพิ่มโดยผู้ดูแลระบบ — "
+                "คอลัมน์ 'โมเดล' คือผลดิบจากโมเดล ส่วน 'ปรับ Baseflow แล้ว' คือค่าที่ใช้ในกราฟสรุป/รายงาน"
+            )
+        else:
+            chart_df = pd.DataFrame({"วันที่": day_labels, "พยากรณ์ (ล้าน ลบ.ม./วัน)": preds})
+            st.line_chart(chart_df.set_index("วันที่"))
+            st.dataframe(chart_df, use_container_width=True, hide_index=True)
 
         st.info(
             "⚠️ ข้อควรระวัง: โมเดลนี้อาจพยากรณ์ต่ำกว่าความเป็นจริงในช่วงน้ำมาก/น้ำท่วมฉับพลัน "
@@ -231,7 +233,6 @@ def _starter_reservoir_table():
 def _starter_station_table():
     row = {"วันที่": datetime.date.today()}
     for code, label in STATIONS:
-        row[f"{label} ระดับน้ำ (ม.)"] = None
         row[f"{label} ปริมาณน้ำ Q (ลบ.ม./วิ)"] = None
     return pd.DataFrame([row])
 
@@ -252,17 +253,19 @@ def page_upload():
     if "res_table" not in st.session_state:
         st.session_state.res_table = _starter_reservoir_table()
 
-    edited_res = st.data_editor(
-        st.session_state.res_table,
-        use_container_width=True,
-        num_rows="dynamic",
-        hide_index=True,
-        column_config={"วันที่": st.column_config.DateColumn("วันที่", format="DD/MM/YYYY")},
-        key="res_editor",
-    )
-    st.session_state.res_table = edited_res
+    # ใช้ form: แก้ตารางได้อิสระโดยหน้าเว็บไม่รีโหลด/ไม่บันทึก จนกว่าจะกดปุ่มบันทึก
+    with st.form("res_form"):
+        edited_res = st.data_editor(
+            st.session_state.res_table,
+            use_container_width=True,
+            num_rows="dynamic",
+            hide_index=True,
+            column_config={"วันที่": st.column_config.DateColumn("วันที่", format="DD/MM/YYYY")},
+            key="res_editor",
+        )
+        save_res = st.form_submit_button("✅ ยืนยันบันทึกข้อมูลอ่าง", type="primary")
 
-    if st.button("✅ ยืนยันบันทึกข้อมูลอ่าง", type="primary"):
+    if save_res:
         try:
             to_save = edited_res.rename(columns={v: k for k, v in RESERVOIR_COLS_TH.items()}).rename(
                 columns={"วันที่": "date"}
@@ -281,25 +284,25 @@ def page_upload():
 
     # ---------------- ตารางข้อมูลสถานีน้ำท่า (อัปเดตรายวัน) ----------------
     st.subheader("ข้อมูลสถานีน้ำท่าต้นน้ำรายวัน (N.1 / N.13A / N.64)")
-    st.caption("กรอกระดับน้ำและปริมาณน้ำ (Q) ของแต่ละสถานี — ใช้ปรับพยากรณ์ให้แม่นขึ้นโดยเฉพาะ 1-3 วันแรก")
+    st.caption("กรอกปริมาณน้ำ (Q) ของแต่ละสถานี — ใช้ปรับพยากรณ์ให้แม่นขึ้นโดยเฉพาะ 1-3 วันแรก")
     if "st_table" not in st.session_state:
         st.session_state.st_table = _starter_station_table()
 
-    edited_st = st.data_editor(
-        st.session_state.st_table,
-        use_container_width=True,
-        num_rows="dynamic",
-        hide_index=True,
-        column_config={"วันที่": st.column_config.DateColumn("วันที่", format="DD/MM/YYYY")},
-        key="st_editor",
-    )
-    st.session_state.st_table = edited_st
+    with st.form("st_form"):
+        edited_st = st.data_editor(
+            st.session_state.st_table,
+            use_container_width=True,
+            num_rows="dynamic",
+            hide_index=True,
+            column_config={"วันที่": st.column_config.DateColumn("วันที่", format="DD/MM/YYYY")},
+            key="st_editor",
+        )
+        save_st = st.form_submit_button("✅ ยืนยันบันทึกข้อมูลสถานีน้ำท่า", type="primary")
 
-    if st.button("✅ ยืนยันบันทึกข้อมูลสถานีน้ำท่า", type="primary"):
+    if save_st:
         try:
             rename_map = {"วันที่": "date"}
             for code, label in STATIONS:
-                rename_map[f"{label} ระดับน้ำ (ม.)"] = f"{code}_level"
                 rename_map[f"{label} ปริมาณน้ำ Q (ลบ.ม./วิ)"] = f"{code}_Q"
             to_save = edited_st.rename(columns=rename_map)
             value_cols = [c for c in to_save.columns if c != "date"]
@@ -388,17 +391,18 @@ def page_upload():
     if "rain_table" not in st.session_state:
         st.session_state.rain_table = _starter_rainfall_table()
 
-    edited_rain = st.data_editor(
-        st.session_state.rain_table,
-        use_container_width=True,
-        num_rows="dynamic",
-        hide_index=True,
-        column_config={"วันที่": st.column_config.DateColumn("วันที่", format="DD/MM/YYYY")},
-        key="rain_editor",
-    )
-    st.session_state.rain_table = edited_rain
+    with st.form("rain_form"):
+        edited_rain = st.data_editor(
+            st.session_state.rain_table,
+            use_container_width=True,
+            num_rows="dynamic",
+            hide_index=True,
+            column_config={"วันที่": st.column_config.DateColumn("วันที่", format="DD/MM/YYYY")},
+            key="rain_editor",
+        )
+        save_rain = st.form_submit_button("✅ ยืนยันบันทึกข้อมูลฝน", type="primary")
 
-    if st.button("✅ ยืนยันบันทึกข้อมูลฝน", type="primary"):
+    if save_rain:
         try:
             to_save = edited_rain.rename(
                 columns={"วันที่": "date", "ปริมาณฝนเฉลี่ยพื้นที่รับน้ำ (มม.)": "rainfall"}
@@ -576,6 +580,13 @@ def page_dashboard():
         st.error(str(e))
         return
 
+    # ผลดิบจากโมเดล -> บวกค่าปรับ Baseflow ที่ผู้ดูแลตั้งไว้ (ถ้ามี) ก่อนนำไปคำนวณสมดุลน้ำ/รายงาน
+    preds_model = preds
+    preds, adj_mcm = baseflow_module.apply_adjustment(preds_model, forecast_dates)
+    is_adjusted = baseflow_module.has_adjustment(adj_mcm)
+    if is_adjusted:
+        st.info("🔧 กราฟและรายงานนี้ใช้ค่าไหลลงอ่างที่ปรับ Baseflow เพิ่มแล้วโดยผู้ดูแลระบบ (ดูผลดิบจากโมเดลในตารางด้านล่าง)")
+
     lookback_days = st.slider("จำนวนวันย้อนหลังที่แสดงในกราฟ", 7, 60, 15)
     hist = df.loc[last_date - datetime.timedelta(days=lookback_days - 1):last_date]
 
@@ -635,12 +646,14 @@ def page_dashboard():
     )
     st.plotly_chart(fig, use_container_width=True)
 
-    table_df = pd.DataFrame({
-        "วันที่": [d.strftime("%d/%m/%Y") for d in forecast_dates],
-        "ไหลลงอ่างคาดการณ์ (ล้าน ลบ.ม./วัน)": [round(p, 2) for p in preds],
-        "ฝนคาดการณ์ (มม.)": [round(v, 2) if v is not None else None for v in (rain_fc_display or [None] * 7)],
-        "ปริมาณน้ำในอ่างคาดการณ์ (ล้าน ลบ.ม.)": [round(s, 2) for s in storage_forecast],
-    })
+    table_cols = {"วันที่": [d.strftime("%d/%m/%Y") for d in forecast_dates]}
+    if is_adjusted:
+        table_cols["ผลโมเดลก่อนปรับ (ล้าน ลบ.ม./วัน)"] = [round(p, 2) for p in preds_model]
+        table_cols["ปรับ Baseflow (ล้าน ลบ.ม./วัน)"] = [round(a, 2) for a in adj_mcm]
+    table_cols["ไหลลงอ่างคาดการณ์ (ล้าน ลบ.ม./วัน)"] = [round(p, 2) for p in preds]
+    table_cols["ฝนคาดการณ์ (มม.)"] = [round(v, 2) if v is not None else None for v in (rain_fc_display or [None] * 7)]
+    table_cols["ปริมาณน้ำในอ่างคาดการณ์ (ล้าน ลบ.ม.)"] = [round(s, 2) for s in storage_forecast]
+    table_df = pd.DataFrame(table_cols)
     st.dataframe(table_df, use_container_width=True, hide_index=True)
 
     st.info(
@@ -655,6 +668,8 @@ def page_dashboard():
     summary_text = report_module.build_summary_text(
         "เขื่อนสิริกิติ์", last_date, last_storage, capacity, forecast_dates, preds, assumed_release, storage_forecast
     )
+    if is_adjusted:
+        summary_text += "\n(หมายเหตุ: ค่าไหลลงอ่างรวมนี้ปรับ Baseflow เพิ่มโดยผู้ดูแลระบบแล้ว)"
     st.markdown(
         f'<div style="background-color:#eaf4fb;padding:12px;border-radius:6px;line-height:1.7">{summary_text.replace(chr(10), "<br>")}</div>',
         unsafe_allow_html=True,
@@ -679,6 +694,216 @@ def page_dashboard():
 
 
 # ---------------------------------------------------------------------------
+# หน้า 5: หลังบ้าน — ปรับ Baseflow รายวัน (ต้องล็อกอินด้วยบัญชีผู้ดูแล)
+# ---------------------------------------------------------------------------
+BF_COL_DATE = "วันที่"
+BF_COL_ADJ = "ปรับเพิ่ม Baseflow (ลบ.ม./วิ)"
+BF_COL_NOTE = "หมายเหตุ"
+BF_WARN_CMS = 300  # เตือนถ้าค่าปรับต่อวันเกินนี้ (ลบ.ม./วิ) — กันกรอกผิดหน่วย
+
+
+def _admin_login_form():
+    if not baseflow_module.admin_configured():
+        st.warning(
+            "ยังไม่ได้ตั้งบัญชีผู้ดูแล — ไปที่ App settings → Secrets แล้วเพิ่มหัวข้อ `[admin_users]` "
+            "(ดูตัวอย่างใน README) หน้านี้จึงจะเปิดใช้งานได้"
+        )
+        return
+    if baseflow_module.login_locked():
+        st.error("ใส่รหัสผ่านผิดเกินจำนวนครั้งที่กำหนด — รีเฟรชหน้าเว็บแล้วลองใหม่")
+        return
+    with st.form("baseflow_login"):
+        u = st.text_input("ชื่อผู้ใช้")
+        pw = st.text_input("รหัสผ่าน", type="password")
+        submitted = st.form_submit_button("เข้าสู่ระบบ", type="primary")
+    if submitted:
+        if baseflow_module.login(u, pw):
+            st.rerun()
+        else:
+            st.error("ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง")
+
+
+def _preview_model_preds(forecast_dates):
+    """รันโมเดลปัจจุบันเพื่อแสดงตัวอย่างก่อน/หลังปรับ คืน (preds, error_message)"""
+    df = build_model_ready_df()
+    if df is None or len(df) < 60:
+        return None, "ยังไม่มีข้อมูลอ่างเพียงพอสำหรับพยากรณ์"
+    models, feature_cols, use_rainfall = model_module.load_models_from_storage()
+    if models is None:
+        return None, "ยังไม่มีโมเดลที่เทรนไว้"
+    rainfall_forecast = None
+    if use_rainfall:
+        pending = data_io.load_rainfall_forecast()
+        if pending.empty:
+            return None, "โมเดลต้องใช้ฝนคาดการณ์ แต่ยังไม่มีฝนคาดการณ์ในระบบ"
+        pending_map = dict(zip(pending["date"].dt.date, pending["rainfall"]))
+        if not all(d.date() in pending_map for d in forecast_dates):
+            return None, "ฝนคาดการณ์ที่อัปโหลดไว้ไม่ครอบคลุม 7 วันข้างหน้า"
+        rainfall_forecast = [float(pending_map[d.date()]) for d in forecast_dates]
+    try:
+        preds = model_module.predict_next_7_days(
+            df, models, feature_cols, use_rainfall=use_rainfall, rainfall_forecast=rainfall_forecast
+        )
+    except ValueError as e:
+        return None, str(e)
+    return preds, None
+
+
+def page_admin():
+    st.header("🔧 หลังบ้าน: ปรับค่า Baseflow รายวัน")
+    user = baseflow_module.current_admin()
+    if not user:
+        st.caption("หน้านี้สำหรับผู้ดูแลระบบ — ต้องเข้าสู่ระบบก่อนจึงจะปรับค่าได้ (ผู้ใช้ทั่วไปเห็นเฉพาะผลที่ปรับแล้วในแท็บอื่น)")
+        _admin_login_form()
+        return
+
+    top1, top2 = st.columns([5, 1])
+    top1.success(f"เข้าสู่ระบบเป็น: {user}")
+    if top2.button("ออกจากระบบ"):
+        baseflow_module.logout()
+        st.rerun()
+
+    st.caption(
+        "ค่าที่กรอกคือ **ปริมาณน้ำที่บวกเพิ่ม** จากผลโมเดลในแต่ละวัน หน่วย ลบ.ม./วินาที (cms) "
+        "ระบบแปลงเป็น ล้าน ลบ.ม./วัน ให้เอง (1 cms = 0.0864 ล้าน ลบ.ม./วัน) "
+        "ใส่ค่าลบได้ถ้าต้องการลด และผลรวมต่อวันจะไม่ต่ำกว่า 0"
+    )
+
+    df = build_model_ready_df()
+    if df is None or df.empty:
+        st.warning("ยังไม่มีข้อมูลอ่างในระบบ — ใช้วันที่ตั้งแต่พรุ่งนี้เป็นฐานแทนไปก่อน")
+        last_date = pd.Timestamp.today().normalize()
+    else:
+        last_date = df.index.max()
+    forecast_dates = [last_date + datetime.timedelta(days=i) for i in range(1, 8)]
+    st.caption(
+        f"ข้อมูลล่าสุด {last_date.strftime('%d/%m/%Y')} → ปรับได้ {forecast_dates[0].strftime('%d/%m/%Y')} "
+        f"ถึง {forecast_dates[-1].strftime('%d/%m/%Y')}"
+    )
+
+    saved = data_io.load_baseflow_adjustments()
+    saved_map = {}
+    for _, r in saved.iterrows():
+        note = "" if pd.isna(r["note"]) else str(r["note"])
+        saved_map[r["date"].date()] = (float(r["adj_cms"]), note)
+
+    # ตั้งต้นตารางจากค่าที่บันทึกไว้ (ทำใหม่เมื่อวันที่ข้อมูลล่าสุดเปลี่ยน)
+    sig = last_date.strftime("%Y-%m-%d")
+    if "bf_table" not in st.session_state or st.session_state.get("bf_sig") != sig:
+        st.session_state.bf_table = pd.DataFrame({
+            BF_COL_DATE: [d.date() for d in forecast_dates],
+            BF_COL_ADJ: [saved_map.get(d.date(), (0.0, ""))[0] for d in forecast_dates],
+            BF_COL_NOTE: [saved_map.get(d.date(), (0.0, ""))[1] for d in forecast_dates],
+        })
+        st.session_state.bf_sig = sig
+        st.session_state.bf_ver = st.session_state.get("bf_ver", 0) + 1
+
+    # ใช้ form: แก้ตารางได้ต่อเนื่องโดยหน้าไม่รีโหลด จนกว่าจะกด "ดูตัวอย่าง" หรือ "บันทึก"
+    with st.form("bf_form"):
+        edited = st.data_editor(
+            st.session_state.bf_table,
+            use_container_width=True,
+            hide_index=True,
+            num_rows="fixed",
+            column_config={
+                BF_COL_DATE: st.column_config.DateColumn(BF_COL_DATE, format="DD/MM/YYYY", disabled=True),
+                BF_COL_ADJ: st.column_config.NumberColumn(
+                    BF_COL_ADJ, step=0.5, format="%.2f", min_value=-2000.0, max_value=2000.0,
+                    help="ค่าบวก = เพิ่มน้ำไหลลงอ่าง, ค่าลบ = ลด",
+                ),
+                BF_COL_NOTE: st.column_config.TextColumn(BF_COL_NOTE, max_chars=200),
+            },
+            key=f"bf_editor_{st.session_state.bf_ver}",
+        )
+        f1, f2, f3 = st.columns([2, 1, 1])
+        fill_val = f1.number_input("ค่าเดียวกันทุกวัน (ลบ.ม./วิ)", value=0.0, step=1.0)
+        fill_clicked = f2.form_submit_button("ใส่ค่านี้ทุกวัน", use_container_width=True)
+        zero_clicked = f3.form_submit_button("ล้างเป็น 0", use_container_width=True)
+        g1, g2 = st.columns(2)
+        preview_clicked = g1.form_submit_button("👁️ ดูตัวอย่างผลหลังปรับ", use_container_width=True)
+        save_clicked = g2.form_submit_button("💾 บันทึกค่าปรับ", type="primary", use_container_width=True)
+
+    if fill_clicked or zero_clicked:
+        new_tbl = edited.copy()  # คงหมายเหตุที่พิมพ์ไว้
+        new_tbl[BF_COL_ADJ] = float(fill_val) if fill_clicked else 0.0
+        st.session_state.bf_table = new_tbl
+        st.session_state.bf_ver += 1
+        st.rerun()
+
+    adj_cms = pd.to_numeric(edited[BF_COL_ADJ], errors="coerce").fillna(0.0)
+    notes = edited[BF_COL_NOTE].fillna("").astype(str)
+    adj_edit_map = {d.date(): float(v) for d, v in zip(forecast_dates, adj_cms)}
+
+    if (adj_cms.abs() > BF_WARN_CMS).any():
+        st.warning(f"มีค่าปรับเกิน {BF_WARN_CMS} ลบ.ม./วิ ต่อวัน — ตรวจสอบหน่วยอีกครั้งก่อนบันทึก")
+
+    # ---- ตัวอย่างผลก่อน/หลังปรับ (แสดงเมื่อกดดูตัวอย่างหรือบันทึก) ----
+    if preview_clicked or save_clicked:
+        st.subheader("ตัวอย่างผลหลังปรับ")
+        adj_mcm_edit = [adj_edit_map[d.date()] * 86400 / 1_000_000 for d in forecast_dates]
+        labels = [d.strftime("%d/%m/%Y") for d in forecast_dates]
+        preds, err = _preview_model_preds(forecast_dates)
+        if preds is None:
+            st.info(f"แสดงตัวอย่างผลพยากรณ์ไม่ได้: {err} — แต่ยังบันทึกค่าปรับไว้ล่วงหน้าได้")
+            st.dataframe(
+                pd.DataFrame({"วันที่": labels, "ปรับเพิ่ม (ลบ.ม./วิ)": list(adj_cms), "เทียบเท่า (ล้าน ลบ.ม./วัน)": [round(a, 3) for a in adj_mcm_edit]}),
+                use_container_width=True, hide_index=True,
+            )
+        else:
+            preds_adj, _ = baseflow_module.apply_adjustment(preds, forecast_dates, adj_edit_map)
+            prev = pd.DataFrame({
+                "วันที่": labels,
+                "ผลโมเดล (ล้าน ลบ.ม./วัน)": preds,
+                "ปรับเพิ่ม (ลบ.ม./วิ)": list(adj_cms),
+                "เทียบเท่า (ล้าน ลบ.ม./วัน)": adj_mcm_edit,
+                "หลังปรับ (ล้าน ลบ.ม./วัน)": preds_adj,
+            })
+            st.line_chart(prev.set_index("วันที่")[["ผลโมเดล (ล้าน ลบ.ม./วัน)", "หลังปรับ (ล้าน ลบ.ม./วัน)"]])
+            st.dataframe(prev.round(2), use_container_width=True, hide_index=True)
+
+    # ---- บันทึก (เมื่อกดปุ่มบันทึกเท่านั้น) ----
+    if save_clicked:
+        try:
+            now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            new_rows = pd.DataFrame({
+                "date": forecast_dates,
+                "adj_cms": list(adj_cms),
+                "note": list(notes),
+                "updated_by": user,
+                "updated_at": now,
+            })
+            edited_dates = {d.date() for d in forecast_dates}
+            frames = []
+            if not saved.empty:
+                frames.append(saved[~saved["date"].dt.date.isin(edited_dates)])
+            nonzero = new_rows[new_rows["adj_cms"].abs() > 1e-9]
+            if not nonzero.empty:
+                frames.append(nonzero)
+            merged = (
+                pd.concat(frames, ignore_index=True).sort_values("date")
+                if frames else pd.DataFrame(columns=data_io.BASEFLOW_COLS)
+            )
+            data_io.save_baseflow_adjustments(merged)
+            data_io.save_baseflow_audit(new_rows)  # บันทึกทุกวันที่แก้ รวมวันที่ตั้งเป็น 0 ไว้ใน audit
+            st.cache_data.clear()
+            st.success(f"บันทึกค่าปรับ Baseflow เรียบร้อย (มีผลทันทีที่หน้าพยากรณ์และกราฟสรุป) — {len(nonzero)} วันที่มีค่าปรับ")
+        except Exception as e:
+            st.error(f"บันทึกไม่สำเร็จ: {e}")
+
+    st.divider()
+    with st.expander("📜 ประวัติการแก้ไข (ใครปรับอะไรเมื่อไหร่)"):
+        audit = data_io.load_baseflow_audit()
+        if audit.empty:
+            st.info("ยังไม่มีประวัติ")
+        else:
+            show = audit.rename(columns={
+                "date": "วันที่ที่ปรับ", "adj_cms": "ปรับ (ลบ.ม./วิ)", "note": "หมายเหตุ",
+                "updated_by": "ผู้แก้ไข", "updated_at": "เวลาที่บันทึก",
+            })
+            st.dataframe(show, use_container_width=True, hide_index=True)
+
+
+# ---------------------------------------------------------------------------
 st.title("🌊 ระบบพยากรณ์น้ำไหลเข้าอ่างเก็บน้ำเขื่อนสิริกิติ์")
 
 if data_io.storage_mode() == "local":
@@ -686,26 +911,14 @@ if data_io.storage_mode() == "local":
 else:
     st.sidebar.success("✅ เชื่อมต่อ Google Drive แล้ว")
 
-# ใช้ lazy loading: Streamlit จะรันเฉพาะแท็บที่กำลังเปิดอยู่
-# ช่วยลดเวลารอ เพราะแต่ละหน้ามีการอ่าน/ประมวลผลข้อมูลหลายชุด
-tab1, tab2, tab3, tab4 = st.tabs(
-    ["📈 พยากรณ์", "📤 อัปโหลดข้อมูลใหม่", "🗂️ ประวัติ", "📊 กราฟสรุป"],
-    on_change="rerun",
-    key="main_tabs",
-)
-
-if tab1.open:
-    with tab1:
-        page_forecast()
-
-if tab2.open:
-    with tab2:
-        page_upload()
-
-if tab3.open:
-    with tab3:
-        page_history()
-
-if tab4.open:
-    with tab4:
-        page_dashboard()
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["📈 พยากรณ์", "📤 อัปโหลดข้อมูลใหม่", "🗂️ ประวัติ", "📊 กราฟสรุป", "🔧 หลังบ้าน (Baseflow)"])
+with tab1:
+    page_forecast()
+with tab2:
+    page_upload()
+with tab3:
+    page_history()
+with tab4:
+    page_dashboard()
+with tab5:
+    page_admin()

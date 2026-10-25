@@ -12,41 +12,19 @@ import io
 import joblib
 import numpy as np
 import pandas as pd
-import streamlit as st
 from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 import data_io
 from features import build_feature_frame, build_latest_feature_row, FORECAST_HORIZON
 
-# ปรับให้เหมาะกับ Streamlit Community Cloud:
-# - ลดจำนวนรอบสูงสุดจาก 300 -> 150
-# - ลดความลึกจาก 6 -> 5
-# - เปิด early stopping เพื่อหยุดเองเมื่อผลไม่ดีขึ้น
-MODEL_PARAMS = dict(
-    max_iter=150,
-    max_depth=5,
-    learning_rate=0.05,
-    early_stopping=True,
-    n_iter_no_change=10,
-    validation_fraction=0.1,
-    random_state=42,
-)
+MODEL_PARAMS = dict(max_iter=300, max_depth=6, learning_rate=0.05, random_state=42)
 RAIN_MIN_DAYS = 90  # ต้องมีข้อมูลฝนย้อนหลังอย่างน้อยเท่านี้ก่อนจะเริ่มใช้เป็น feature
 
 
-def train_all_horizons(
-    df: pd.DataFrame,
-    min_date="2006-01-01",
-    test_frac=0.15,
-    progress_callback=None,
-):
+def train_all_horizons(df: pd.DataFrame, min_date="2006-01-01", test_frac=0.15):
     """เทรนโมเดลทั้ง 7 horizon คืนค่า (models, metrics, feature_cols, use_rainfall)
-    ใช้ time-based split (ท้ายสุดของข้อมูลเป็น test) ห้ามสุ่มแบ่ง
-
-    progress_callback(h, total, model) จะถูกเรียกหลังเทรนแต่ละ horizon
-    เพื่อให้หน้าเว็บแสดงความคืบหน้าได้โดยไม่ต้องเปลี่ยนวิธีการพยากรณ์เดิม
-    """
+    ใช้ time-based split (ท้ายสุดของข้อมูลเป็น test) ห้ามสุ่มแบ่ง"""
     df = df[df.index >= min_date]
     feat_base = build_feature_frame(df)
 
@@ -81,8 +59,6 @@ def train_all_horizons(
             }
         )
         models[h] = model
-        if progress_callback is not None:
-            progress_callback(h, FORECAST_HORIZON, model)
 
     metrics = pd.DataFrame(rows)
     return models, metrics, feature_cols, use_rainfall
@@ -96,7 +72,6 @@ def save_models_to_storage(models: dict, feature_cols: list, use_rainfall: bool)
     data_io.save_models(buf.getvalue())
 
 
-@st.cache_resource(show_spinner="กำลังโหลดโมเดลพยากรณ์...")
 def load_models_from_storage():
     raw = data_io.load_models_bytes()
     if raw is None:
