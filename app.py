@@ -473,49 +473,6 @@ def page_upload():
             except Exception as e:
                 st.error(f"นำเข้าไม่สำเร็จ: {e}")
 
-    with st.expander("📈 อัปโหลด Rule Curve / เกณฑ์ระดับน้ำอ่าง"):
-        st.caption(
-            "รองรับ .xlsx หรือ .csv มีคอลัมน์วันที่ และอย่างน้อยหนึ่งคอลัมน์ต่อไปนี้: "
-            "upper_storage / lower_storage (ล้าน ลบ.ม.) หรือ upper_level / lower_level (ม.รทก.). "
-            "ชื่อคอลัมน์ภาษาไทยที่รองรับ: วันที่, Upper Rule Curve, Lower Rule Curve, ระดับเก็บกักบน, ระดับเก็บกักล่าง, ระดับน้ำบน, ระดับน้ำล่าง. "
-            "ไฟล์นี้ใช้วาดเส้นเกณฑ์เทียบกับผลคาดการณ์ ไม่ได้เป็นข้อมูลฝึกโมเดล"
-        )
-        rc_file = st.file_uploader("ไฟล์ Rule Curve (.xlsx หรือ .csv)", type=["xlsx", "csv"], key="rule_curve_uploader")
-        current_rc = data_io.load_rule_curve()
-        if not current_rc.empty:
-            st.success(f"มี Rule Curve ในระบบแล้ว {len(current_rc)} แถว ({current_rc['date'].min().date()} ถึง {current_rc['date'].max().date()}) — อัปโหลดใหม่เพื่อแทนที่ได้")
-        if rc_file is not None and st.button("บันทึก Rule Curve", key="save_rule_curve_btn"):
-            try:
-                raw = rc_file.read()
-                raw_df = pd.read_excel(io.BytesIO(raw)) if rc_file.name.lower().endswith(".xlsx") else pd.read_csv(io.BytesIO(raw), encoding="utf-8-sig")
-                aliases = {
-                    "วันที่": "date", "date": "date", "Date": "date", "วันที่ข้อมูล": "date",
-                    "Upper Rule Curve": "upper_storage", "upper_rule_curve": "upper_storage", "upper_storage": "upper_storage", "ระดับเก็บกักบน": "upper_storage",
-                    "Lower Rule Curve": "lower_storage", "lower_rule_curve": "lower_storage", "lower_storage": "lower_storage", "ระดับเก็บกักล่าง": "lower_storage",
-                    "upper_level": "upper_level", "ระดับน้ำบน": "upper_level", "Upper Level": "upper_level",
-                    "lower_level": "lower_level", "ระดับน้ำล่าง": "lower_level", "Lower Level": "lower_level",
-                }
-                raw_df = raw_df.rename(columns={c: aliases.get(str(c).strip(), str(c).strip()) for c in raw_df.columns})
-                if "date" not in raw_df.columns:
-                    raise ValueError("ไม่พบคอลัมน์วันที่ (date หรือ วันที่)")
-                raw_df["date"] = pd.to_datetime(raw_df["date"], errors="coerce", dayfirst=True)
-                for col in ["upper_storage", "lower_storage", "upper_level", "lower_level"]:
-                    if col in raw_df.columns:
-                        raw_df[col] = pd.to_numeric(raw_df[col], errors="coerce")
-                allowed = [c for c in ["upper_storage", "lower_storage", "upper_level", "lower_level"] if c in raw_df.columns and raw_df[c].notna().any()]
-                if not allowed:
-                    raise ValueError("ไม่พบคอลัมน์ Rule Curve ที่มีตัวเลข ตรวจชื่อคอลัมน์และหน่วยในไฟล์")
-                clean = raw_df[["date"] + allowed].dropna(subset=["date"]).drop_duplicates("date", keep="last").sort_values("date")
-                for col in ["upper_storage", "lower_storage", "upper_level", "lower_level"]:
-                    if col not in clean.columns:
-                        clean[col] = float("nan")
-                data_io.save_rule_curve(clean[["date", "upper_storage", "lower_storage", "upper_level", "lower_level"]])
-                st.cache_data.clear()
-                st.success(f"บันทึก Rule Curve สำเร็จ {len(clean)} แถว")
-                st.dataframe(clean, use_container_width=True, hide_index=True)
-            except Exception as e:
-                st.error(f"บันทึก Rule Curve ไม่สำเร็จ: {e}")
-
     with st.expander("📁 อัปโหลดขอบเขตพื้นที่รับน้ำ / shapefile (ทำครั้งเดียวตอน setup เท่านั้น)"):
         st.caption(
             "ใช้ตัดพื้นที่รับน้ำสำหรับคำนวณฝนเฉลี่ยพื้นที่จากไฟล์กริดฝนพยากรณ์ (d01/d02) — ไม่ต้องอัปโหลดซ้ำทุกวัน "
@@ -638,20 +595,17 @@ def page_dashboard():
     hist = df.loc[last_date - datetime.timedelta(days=lookback_days - 1):last_date]
 
     recent_release_avg = float(df["release"].tail(7).mean())
-    saved_plan = data_io.load_release_plan()
-    release_map = {r["date"].date(): float(r["release_mcm"]) for _, r in saved_plan.iterrows() if pd.notna(r["date"])} if not saved_plan.empty else {}
-    release_values = [release_map.get(d.date(), round(recent_release_avg, 2)) for d in forecast_dates]
-    release_df = pd.DataFrame({"วันที่": forecast_dates, "แผนระบาย (ล้าน ลบ.ม./วัน)": release_values})
-    st.caption("สมดุลน้ำใช้แผนระบายแยกแต่ละวันจากหลังบ้าน หากไม่มีแผนสำหรับวันนั้นจะใช้ค่าเฉลี่ยระบายจริง 7 วันล่าสุด")
-    st.dataframe(release_df.assign(วันที่=release_df["วันที่"].dt.strftime("%d/%m/%Y")), use_container_width=True, hide_index=True)
-    release_schedule = [float(v) for v in release_values]
+    assumed_release = st.number_input(
+        "สมมติฐานปริมาณน้ำระบายต่อวันช่วงคาดการณ์ (ล้าน ลบ.ม./วัน) — ค่าเริ่มต้นคือเฉลี่ย 7 วันล่าสุดที่มีจริง",
+        min_value=0.0, value=round(recent_release_avg, 2), step=0.5,
+    )
 
     capacity = float(df["capacity"].iloc[-1])
     last_storage = float(df["storage"].iloc[-1])
     storage_forecast = []
     running = last_storage
-    for p, rel in zip(preds, release_schedule):
-        running = running + p - rel
+    for p in preds:
+        running = running + p - assumed_release
         storage_forecast.append(running)
 
     # ฝนสำหรับแสดงผล (ถ้ามี) — ไม่จำเป็นต้องเป็นตัวเดียวกับที่ใช้รันโมเดล เอาไว้ดูประกอบกราฟ
@@ -676,14 +630,6 @@ def page_dashboard():
         x=[hist.index.min(), forecast_dates[-1]], y=[capacity, capacity], mode="lines",
         name=f"ความจุเก็บกัก ({capacity:,.2f} ล้าน ลบ.ม.)", line=dict(color="#d62728", dash="dot"),
     ))
-    rule_curve = data_io.load_rule_curve()
-    if not rule_curve.empty:
-        rc = rule_curve.copy()
-        rc["date"] = pd.to_datetime(rc["date"])
-        rc_future = rc[(rc["date"] >= pd.Timestamp(last_date)) & (rc["date"] <= pd.Timestamp(forecast_dates[-1]))]
-        for col, label, color in [("upper_storage", "Upper Rule Curve (ล้าน ลบ.ม.)", "#9467bd"), ("lower_storage", "Lower Rule Curve (ล้าน ลบ.ม.)", "#2ca02c")]:
-            if col in rc_future.columns and rc_future[col].notna().any():
-                fig.add_trace(go.Scatter(x=rc_future["date"], y=rc_future[col], mode="lines+markers", name=label, line=dict(color=color, dash="dot")))
     if not rain_hist.dropna().empty:
         fig.add_trace(go.Bar(
             x=rain_hist.index, y=rain_hist.values, name="ฝนจริงเฉลี่ย (มม.)",
@@ -704,29 +650,12 @@ def page_dashboard():
     )
     st.plotly_chart(fig, use_container_width=True)
 
-    # กราฟระดับน้ำ (ม.รทก.) แยกจากกราฟปริมาตร เพื่อไม่ปะปนหน่วย
-    rule_curve = data_io.load_rule_curve()
-    if not rule_curve.empty and any(c in rule_curve.columns and rule_curve[c].notna().any() for c in ["upper_level", "lower_level"]):
-        fig_level = go.Figure()
-        fig_level.add_trace(go.Scatter(x=hist.index, y=hist["level"], mode="lines+markers", name="ระดับน้ำจริง (ม.รทก.)", line=dict(color="#1f77b4")))
-        # ระดับน้ำคาดการณ์ไม่สามารถอนุมานจากปริมาตรได้โดยไม่มีตารางแปลงระดับ-ปริมาตร จึงแสดง Rule Curve เท่านั้น
-        rc_level = rule_curve.copy()
-        rc_level["date"] = pd.to_datetime(rc_level["date"])
-        rc_level = rc_level[(rc_level["date"] >= hist.index.min()) & (rc_level["date"] <= pd.Timestamp(forecast_dates[-1]))]
-        for col, label, color in [("upper_level", "Upper Rule Curve (ม.รทก.)", "#9467bd"), ("lower_level", "Lower Rule Curve (ม.รทก.)", "#2ca02c")]:
-            if col in rc_level.columns and rc_level[col].notna().any():
-                fig_level.add_trace(go.Scatter(x=rc_level["date"], y=rc_level[col], mode="lines+markers", name=label, line=dict(color=color, dash="dot")))
-        fig_level.update_layout(title="ระดับน้ำจริงเทียบกับ Rule Curve (ม.รทก.)", yaxis_title="ระดับน้ำ (ม.รทก.)", hovermode="x unified", margin=dict(t=45))
-        st.plotly_chart(fig_level, use_container_width=True)
-        st.caption("ระดับน้ำคาดการณ์ยังไม่แสดง: ต้องมีตารางแปลงปริมาตรน้ำเป็นระดับน้ำสำหรับการคำนวณที่ถูกต้อง")
-
     table_cols = {"วันที่": [d.strftime("%d/%m/%Y") for d in forecast_dates]}
     if is_adjusted:
         table_cols["ผลโมเดลก่อนปรับ (ล้าน ลบ.ม./วัน)"] = [round(p, 2) for p in preds_model]
         table_cols["ปรับ Baseflow (ล้าน ลบ.ม./วัน)"] = [round(a, 2) for a in adj_mcm]
     table_cols["ไหลลงอ่างคาดการณ์ (ล้าน ลบ.ม./วัน)"] = [round(p, 2) for p in preds]
     table_cols["ฝนคาดการณ์ (มม.)"] = [round(v, 2) if v is not None else None for v in (rain_fc_display or [None] * 7)]
-    table_cols["แผนระบาย (ล้าน ลบ.ม./วัน)"] = [round(v, 2) for v in release_schedule]
     table_cols["ปริมาณน้ำในอ่างคาดการณ์ (ล้าน ลบ.ม.)"] = [round(s, 2) for s in storage_forecast]
     table_df = pd.DataFrame(table_cols)
     st.dataframe(table_df, use_container_width=True, hide_index=True)
@@ -981,44 +910,6 @@ def page_admin():
             st.success(f"บันทึกค่าปรับ Baseflow เรียบร้อย (มีผลทันทีที่หน้าพยากรณ์และกราฟสรุป) — {len(nonzero)} วันที่มีค่าปรับ")
         except Exception as e:
             st.error(f"บันทึกไม่สำเร็จ: {e}")
-
-    st.divider()
-    st.subheader("🚰 แผนการระบายรายวัน")
-    st.caption("กรอกแผนระบายแต่ละวันได้ไม่เท่ากัน หน่วยล้าน ลบ.ม./วัน ใช้สำหรับคำนวณแนวโน้มปริมาณน้ำคงเหลือแบบสมดุลน้ำอย่างง่าย ไม่ใช่ผลจากโมเดล ML")
-    saved_release = data_io.load_release_plan()
-    release_map_saved = {r["date"].date(): (float(r["release_mcm"]), "" if pd.isna(r["note"]) else str(r["note"])) for _, r in saved_release.iterrows() if pd.notna(r["date"])} if not saved_release.empty else {}
-    if "release_table" not in st.session_state or st.session_state.get("release_sig") != sig:
-        recent_release = float(df["release"].tail(7).mean()) if df is not None and not df.empty else 0.0
-        st.session_state.release_table = pd.DataFrame({
-            "วันที่": [d.date() for d in forecast_dates],
-            "แผนระบาย (ล้าน ลบ.ม./วัน)": [release_map_saved.get(d.date(), (round(recent_release, 2), ""))[0] for d in forecast_dates],
-            "หมายเหตุ": [release_map_saved.get(d.date(), (0.0, ""))[1] for d in forecast_dates],
-        })
-        st.session_state.release_sig = sig
-        st.session_state.release_ver = st.session_state.get("release_ver", 0) + 1
-    with st.form("release_plan_form"):
-        edited_release = st.data_editor(
-            st.session_state.release_table, use_container_width=True, hide_index=True, num_rows="fixed",
-            column_config={
-                "วันที่": st.column_config.DateColumn("วันที่", format="DD/MM/YYYY", disabled=True),
-                "แผนระบาย (ล้าน ลบ.ม./วัน)": st.column_config.NumberColumn("แผนระบาย (ล้าน ลบ.ม./วัน)", min_value=0.0, max_value=1000.0, step=0.5, format="%.2f"),
-                "หมายเหตุ": st.column_config.TextColumn("หมายเหตุ", max_chars=200),
-            }, key=f"release_editor_{st.session_state.release_ver}",
-        )
-        save_release_clicked = st.form_submit_button("💾 บันทึกแผนระบายรายวัน", type="primary")
-    if save_release_clicked:
-        try:
-            release_out = edited_release.rename(columns={"วันที่": "date", "แผนระบาย (ล้าน ลบ.ม./วัน)": "release_mcm", "หมายเหตุ": "note"})
-            release_out["date"] = pd.to_datetime(release_out["date"])
-            release_out["release_mcm"] = pd.to_numeric(release_out["release_mcm"], errors="coerce")
-            if release_out["release_mcm"].isna().any() or (release_out["release_mcm"] < 0).any():
-                raise ValueError("แผนระบายต้องเป็นตัวเลขตั้งแต่ 0 ขึ้นไป")
-            data_io.save_release_plan(release_out)
-            st.cache_data.clear()
-            st.success("บันทึกแผนระบายรายวันแล้ว ระบบจะใช้ค่ารายวันในการคำนวณแนวโน้มปริมาณน้ำคงเหลือ")
-            st.dataframe(release_out, use_container_width=True, hide_index=True)
-        except Exception as e:
-            st.error(f"บันทึกแผนระบายไม่สำเร็จ: {e}")
 
     st.divider()
     with st.expander("📜 ประวัติการแก้ไข (ใครปรับอะไรเมื่อไหร่)"):
