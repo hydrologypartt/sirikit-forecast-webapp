@@ -310,6 +310,63 @@ def load_rainfall_forecast() -> pd.DataFrame:
     return df
 
 
+
+# ---------------------------------------------------------------------------
+# ตารางแผนระบายรายวัน และ Rule Curve (อัปโหลดไฟล์ล่าสุด)
+# ---------------------------------------------------------------------------
+RELEASE_PLAN_FILE = "release_plan.csv"
+RULE_CURVE_FILE = "rule_curve.csv"
+
+def _save_named_csv(filename: str, df: pd.DataFrame):
+    df_out = df.copy()
+    if "date" in df_out.columns:
+        df_out["date"] = pd.to_datetime(df_out["date"]).dt.strftime("%Y-%m-%d")
+    content = df_out.to_csv(index=False).encode("utf-8-sig")
+    if storage_mode() == "drive":
+        _drive_upload(filename, content)
+    else:
+        os.makedirs(LOCAL_DATA_DIR, exist_ok=True)
+        with open(os.path.join(LOCAL_DATA_DIR, filename), "wb") as f:
+            f.write(content)
+
+def _load_named_csv(filename: str, columns: list) -> pd.DataFrame:
+    if storage_mode() == "drive":
+        matches = [f for f in _drive_list_filenames(prefix=filename) if f["name"] == filename]
+        if not matches:
+            return pd.DataFrame(columns=columns)
+        content = _drive_download(matches[0]["id"])
+    else:
+        path = os.path.join(LOCAL_DATA_DIR, filename)
+        if not os.path.exists(path):
+            return pd.DataFrame(columns=columns)
+        with open(path, "rb") as f:
+            content = f.read()
+    df = pd.read_csv(io.BytesIO(content))
+    if df.empty:
+        return pd.DataFrame(columns=columns)
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    return df.reindex(columns=columns)
+
+def save_release_plan(df: pd.DataFrame):
+    """บันทึกแผนระบายรายวัน หน่วยล้าน ลบ.ม./วัน; คอลัมน์ date, release_mcm, note"""
+    _save_named_csv(RELEASE_PLAN_FILE, df.reindex(columns=["date", "release_mcm", "note"]))
+
+@st.cache_data(ttl=60)
+def load_release_plan() -> pd.DataFrame:
+    df = _load_named_csv(RELEASE_PLAN_FILE, ["date", "release_mcm", "note"])
+    if not df.empty:
+        df["release_mcm"] = pd.to_numeric(df["release_mcm"], errors="coerce").fillna(0.0)
+    return df
+
+def save_rule_curve(df: pd.DataFrame):
+    """บันทึก Rule Curve รายวัน โดยรับคอลัมน์ date และคอลัมน์เส้นระดับ/ปริมาตรที่มี"""
+    _save_named_csv(RULE_CURVE_FILE, df)
+
+@st.cache_data(ttl=60)
+def load_rule_curve() -> pd.DataFrame:
+    return _load_named_csv(RULE_CURVE_FILE, ["date", "upper_storage", "lower_storage", "upper_level", "lower_level"])
+
 def save_rainfall_snapshot(df_new_rows: pd.DataFrame):
     """บันทึกข้อมูลฝนเฉลี่ยพื้นที่รายวัน (สำหรับสะสมไว้เทรนโมเดล)
     df_new_rows ต้องมีคอลัมน์: date, rainfall (มม.)"""
