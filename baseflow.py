@@ -9,10 +9,11 @@ baseflow.py
   - ผู้ใช้ทั่วไปเห็นผลที่ปรับแล้วในหน้าพยากรณ์/กราฟสรุป แต่แก้ค่าไม่ได้
     การแก้ไขทำได้เฉพาะแท็บหลังบ้านที่ต้องล็อกอิน (บัญชีตั้งใน st.secrets)
 
-ตั้งบัญชีผู้ดูแลใน Secrets (ดู README):
-    [admin_users]
-    somchai = "รหัสผ่าน"
-    # หรือเก็บเป็น hash (แนะนำ):  somchai = "sha256:<hex ของรหัสผ่าน>"
+ตั้งบัญชีใน Secrets (ดู README):
+    [users]          # ผู้ใช้ทั่วไป: รันโมเดลได้
+    nong = "sha256:<hex ของรหัสผ่าน>"
+    [admin_users]    # ผู้ดูแล: รันโมเดล + ปรับ Baseflow
+    somchai = "sha256:<hex ของรหัสผ่าน>"   # หรือใส่รหัสผ่านตรงๆ ก็ได้
 """
 import hashlib
 import hmac
@@ -26,19 +27,28 @@ MAX_LOGIN_ATTEMPTS = 5  # ต่อ session — กันกดเดารห�
 
 
 # ---------------------------------------------------------------------------
-# ล็อกอินผู้ดูแล
+# ล็อกอิน (2 บทบาท)
+#   user  = ผู้ใช้ทั่วไป  : รันโมเดล/ดูกราฟสรุปได้
+#   admin = ผู้ดูแล       : ทำได้ทุกอย่างของ user + ปรับ Baseflow ในหน้าหลังบ้าน
 # ---------------------------------------------------------------------------
-def _admin_users() -> dict:
+def _read_accounts(section: str) -> dict:
     try:
-        if "admin_users" in st.secrets:
-            return {str(k): str(v) for k, v in dict(st.secrets["admin_users"]).items()}
+        if section in st.secrets:
+            return {str(k): str(v) for k, v in dict(st.secrets[section]).items()}
     except Exception:
         pass
     return {}
 
 
-def admin_configured() -> bool:
-    return len(_admin_users()) > 0
+def _all_accounts() -> dict:
+    """{username: (stored_password, role)} — ถ้าชื่อซ้ำกันในสองหมวด ให้สิทธิ์ admin ก่อน"""
+    accounts = {k: (v, "user") for k, v in _read_accounts("users").items()}
+    accounts.update({k: (v, "admin") for k, v in _read_accounts("admin_users").items()})
+    return accounts
+
+
+def accounts_configured() -> bool:
+    return len(_all_accounts()) > 0
 
 
 def _password_matches(stored: str, given: str) -> bool:
@@ -48,38 +58,60 @@ def _password_matches(stored: str, given: str) -> bool:
     return hmac.compare_digest(stored.encode("utf-8"), given.encode("utf-8"))
 
 
-def verify_admin(username: str, password: str) -> bool:
-    users = _admin_users()
-    stored = users.get(username)
-    if stored is None:
+def _verify(username: str, password: str):
+    """คืน role ('user'/'admin') ถ้ารหัสถูก ไม่งั้นคืน None"""
+    entry = _all_accounts().get(username)
+    if entry is None:
         # เทียบกับค่าหลอกเพื่อให้เวลาตอบใกล้เคียงกัน ไม่เผยว่าชื่อผู้ใช้มีอยู่จริงหรือไม่
         _password_matches("x" * 8, password)
-        return False
-    return _password_matches(stored, password)
+        return None
+    stored, role = entry
+    return role if _password_matches(stored, password) else None
+
+
+def current_user():
+    return st.session_state.get("auth_user")
+
+
+def current_role():
+    return st.session_state.get("auth_role")
+
+
+def is_logged_in() -> bool:
+    return current_user() is not None
+
+
+def is_admin() -> bool:
+    return current_role() == "admin"
 
 
 def current_admin():
-    return st.session_state.get("baseflow_admin_user")
+    """คืนชื่อผู้ใช้ถ้าล็อกอินเป็น admin ไม่งั้น None"""
+    return current_user() if is_admin() else None
 
 
 def login(username: str, password: str) -> bool:
     """คืน True ถ้าล็อกอินสำเร็จ (และจำไว้ใน session)"""
-    if st.session_state.get("baseflow_login_fail", 0) >= MAX_LOGIN_ATTEMPTS:
+    if login_locked():
         return False
-    if verify_admin(username.strip(), password):
-        st.session_state["baseflow_admin_user"] = username.strip()
-        st.session_state["baseflow_login_fail"] = 0
+    username = username.strip()
+    role = _verify(username, password)
+    if role is not None:
+        st.session_state["auth_user"] = username
+        st.session_state["auth_role"] = role
+        st.session_state["auth_login_fail"] = 0
         return True
-    st.session_state["baseflow_login_fail"] = st.session_state.get("baseflow_login_fail", 0) + 1
+    st.session_state["auth_login_fail"] = st.session_state.get("auth_login_fail", 0) + 1
     return False
 
 
 def logout():
-    st.session_state.pop("baseflow_admin_user", None)
+    st.session_state.pop("auth_user", None)
+    st.session_state.pop("auth_role", None)
 
 
 def login_locked() -> bool:
-    return st.session_state.get("baseflow_login_fail", 0) >= MAX_LOGIN_ATTEMPTS
+    return st.session_state.get("auth_login_fail", 0) >= MAX_LOGIN_ATTEMPTS
 
 
 # ---------------------------------------------------------------------------

@@ -106,6 +106,8 @@ def build_model_ready_df():
 # ---------------------------------------------------------------------------
 def page_forecast():
     st.header("พยากรณ์น้ำไหลเข้าอ่าง 7 วันล่วงหน้า")
+    if not _require_login():
+        return
 
     df = build_model_ready_df()
     if df is None or len(df) < 60:
@@ -545,6 +547,8 @@ def page_dashboard():
     import plotly.graph_objects as go
 
     st.header("กราฟสรุปปริมาณน้ำในอ่าง: ย้อนหลัง + คาดการณ์ 7 วัน")
+    if not _require_login():
+        return
 
     df = build_model_ready_df()
     if df is None or len(df) < 60:
@@ -702,25 +706,46 @@ BF_COL_NOTE = "หมายเหตุ"
 BF_WARN_CMS = 300  # เตือนถ้าค่าปรับต่อวันเกินนี้ (ลบ.ม./วิ) — กันกรอกผิดหน่วย
 
 
-def _admin_login_form():
-    if not baseflow_module.admin_configured():
+def render_login_box():
+    """ช่องเข้าสู่ระบบกลางของทั้งแอป (แสดงบนสุดของหน้า ก่อนแท็บ) — ต้องล็อกอินก่อนรันโมเดล"""
+    if baseflow_module.is_logged_in():
+        role_th = "ผู้ดูแล" if baseflow_module.is_admin() else "ผู้ใช้"
+        c1, c2 = st.columns([6, 1])
+        c1.success(f"🔐 เข้าสู่ระบบเป็น {baseflow_module.current_user()} ({role_th})")
+        if c2.button("ออกจากระบบ", use_container_width=True):
+            baseflow_module.logout()
+            st.rerun()
+        return
+    if not baseflow_module.accounts_configured():
         st.warning(
-            "ยังไม่ได้ตั้งบัญชีผู้ดูแล — ไปที่ App settings → Secrets แล้วเพิ่มหัวข้อ `[admin_users]` "
-            "(ดูตัวอย่างใน README) หน้านี้จึงจะเปิดใช้งานได้"
+            "ยังไม่ได้ตั้งบัญชีผู้ใช้ — ไปที่ App settings → Secrets แล้วเพิ่มหัวข้อ `[users]` และ/หรือ `[admin_users]` "
+            "(ดูตัวอย่างใน README) ระบบจึงจะอนุญาตให้รันโมเดลได้"
         )
         return
-    if baseflow_module.login_locked():
-        st.error("ใส่รหัสผ่านผิดเกินจำนวนครั้งที่กำหนด — รีเฟรชหน้าเว็บแล้วลองใหม่")
-        return
-    with st.form("baseflow_login"):
-        u = st.text_input("ชื่อผู้ใช้")
-        pw = st.text_input("รหัสผ่าน", type="password")
-        submitted = st.form_submit_button("เข้าสู่ระบบ", type="primary")
-    if submitted:
-        if baseflow_module.login(u, pw):
-            st.rerun()
-        else:
-            st.error("ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง")
+    with st.expander("🔐 เข้าสู่ระบบ (ต้องเข้าสู่ระบบก่อนจึงจะรันโมเดลได้)", expanded=True):
+        if baseflow_module.login_locked():
+            st.error("ใส่รหัสผ่านผิดเกินจำนวนครั้งที่กำหนด — รีเฟรชหน้าเว็บแล้วลองใหม่")
+            return
+        with st.form("login_form"):
+            u = st.text_input("ชื่อผู้ใช้")
+            pw = st.text_input("รหัสผ่าน", type="password")
+            submitted = st.form_submit_button("เข้าสู่ระบบ", type="primary")
+        if submitted:
+            if baseflow_module.login(u, pw):
+                st.rerun()
+            else:
+                st.error("ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง")
+
+
+def _require_login() -> bool:
+    """ใช้ต้นหน้าที่รันโมเดล: คืน True ถ้าล็อกอินแล้ว ไม่งั้นแสดงข้อความและคืน False"""
+    if baseflow_module.is_logged_in():
+        return True
+    if not baseflow_module.accounts_configured():
+        st.warning("ยังไม่ได้ตั้งบัญชีผู้ใช้ในระบบ จึงยังรันโมเดลไม่ได้ — ดูวิธีตั้งค่าใน README")
+    else:
+        st.info("🔐 ต้องเข้าสู่ระบบก่อนจึงจะรันโมเดลได้ — เข้าสู่ระบบที่ช่องบนสุดของหน้า")
+    return False
 
 
 def _preview_model_preds(forecast_dates):
@@ -753,15 +778,11 @@ def page_admin():
     st.header("🔧 หลังบ้าน: ปรับค่า Baseflow รายวัน")
     user = baseflow_module.current_admin()
     if not user:
-        st.caption("หน้านี้สำหรับผู้ดูแลระบบ — ต้องเข้าสู่ระบบก่อนจึงจะปรับค่าได้ (ผู้ใช้ทั่วไปเห็นเฉพาะผลที่ปรับแล้วในแท็บอื่น)")
-        _admin_login_form()
+        if baseflow_module.is_logged_in():
+            st.warning("บัญชีนี้เป็นผู้ใช้ทั่วไป — หน้านี้ต้องใช้บัญชีผู้ดูแล (แอดมิน) เท่านั้น")
+        else:
+            st.info("🔐 หน้านี้สำหรับผู้ดูแลระบบ — เข้าสู่ระบบด้วยบัญชีแอดมินที่ช่องบนสุดของหน้า")
         return
-
-    top1, top2 = st.columns([5, 1])
-    top1.success(f"เข้าสู่ระบบเป็น: {user}")
-    if top2.button("ออกจากระบบ"):
-        baseflow_module.logout()
-        st.rerun()
 
     st.caption(
         "ค่าที่กรอกคือ **ปริมาณน้ำที่บวกเพิ่ม** จากผลโมเดลในแต่ละวัน หน่วย ลบ.ม./วินาที (cms) "
@@ -910,6 +931,8 @@ if data_io.storage_mode() == "local":
     st.sidebar.warning("⚠️ กำลังใช้ local storage (ยังไม่ได้ตั้งค่า Google Drive) — ข้อมูลจะหายถ้า deploy ใหม่")
 else:
     st.sidebar.success("✅ เชื่อมต่อ Google Drive แล้ว")
+
+render_login_box()
 
 tab1, tab2, tab3, tab4, tab5 = st.tabs(["📈 พยากรณ์", "📤 อัปโหลดข้อมูลใหม่", "🗂️ ประวัติ", "📊 กราฟสรุป", "🔧 หลังบ้าน (Baseflow)"])
 with tab1:
