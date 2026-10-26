@@ -37,7 +37,8 @@ def build_summary_text(dam_name, last_date, last_storage, capacity, forecast_dat
     pct_now = last_storage / capacity * 100
     remain_now = capacity - last_storage
     total_inflow = sum(preds)
-    total_release = assumed_release * len(preds)
+    releases = list(assumed_release) if isinstance(assumed_release, (list, tuple)) else [float(assumed_release)] * len(preds)
+    total_release = sum(releases)
     net = total_inflow - total_release
     end_storage = storage_forecast[-1]
     pct_end = end_storage / capacity * 100
@@ -51,7 +52,7 @@ def build_summary_text(dam_name, last_date, last_storage, capacity, forecast_dat
         f"สถานการณ์ปัจจุบัน วันที่ {d0} มีปริมาณน้ำในอ่างฯ {last_storage:,.2f} ล้าน ลบ.ม. "
         f"คิดเป็น {pct_now:.2f}% ของความจุเก็บกัก สามารถรับน้ำได้อีก {remain_now:,.2f} ล้าน ลบ.ม.\n"
         f"คาดการณ์ วันที่ {d_start} – {d_end} จะมีปริมาณน้ำไหลลงอ่างฯ รวม {total_inflow:,.2f} ล้าน ลบ.ม. "
-        f"คงการระบายน้ำที่ {assumed_release:,.2f} ล้าน ลบ.ม./วัน จะมีน้ำระบายออกรวม {total_release:,.2f} ล้าน ลบ.ม. "
+        f"ตามแผนระบายรายวัน จะมีน้ำระบายออกรวม {total_release:,.2f} ล้าน ลบ.ม. "
         f"{'เหลือน้ำสะสม' if net >= 0 else 'ขาดดุลน้ำ'} {abs(net):,.2f} ล้าน ลบ.ม. "
         f"วันที่ {d_end} จะมีปริมาณน้ำในอ่าง {end_storage:,.2f} ล้าน ลบ.ม. "
         f"คิดเป็น {pct_end:.2f}% ของความจุเก็บกัก สามารถรับน้ำได้อีก {remain_end:,.2f} ล้าน ลบ.ม."

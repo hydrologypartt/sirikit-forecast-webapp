@@ -473,9 +473,9 @@ def page_upload():
 
     with st.expander("📈 อัปโหลด Rule Curve / เกณฑ์ระดับน้ำอ่าง"):
         st.caption(
-            "รองรับ CSV และ Excel ตามหัวตาราง: วันที่, date, ความจุที่ (รนส.), ความจุที่ (รนก.), "
-            "Upper Rule Curve, Lower Rule Curve — ค่าปริมาตรมีหน่วยล้าน ลบ.ม. "
-            "หากมีทั้ง วันที่ และ date จะใช้ date เป็นหลัก โดยเก็บค่าความจุทั้งสองคอลัมน์ไว้ในข้อมูล Rule Curve ด้วย"
+            "รองรับ CSV และ Excel รวมทั้งไฟล์ข้อมูลเขื่อน.csv (ความจุที่ (รนส.), ระดับน้ำต่ำสุด, ความจุที่ (รนก.), URC, LRC) "
+            "โดย URC/LRC เท่ากับ Upper/Lower Rule Curve หน่วยล้าน ลบ.ม. "
+            "ไฟล์ที่ไม่มีวันที่ต้องมี 365 หรือ 366 แถวเรียงตามวันตั้งแต่ 1 มกราคม; ระบบจะนำเส้นเกณฑ์ไปเทียบตามวันและเดือนในทุกปี"
         )
         rc_file = st.file_uploader("ไฟล์ Rule Curve (.xlsx หรือ .csv)", type=["xlsx", "csv"], key="rule_curve_uploader")
         current_rc = data_io.load_rule_curve()
@@ -488,9 +488,9 @@ def page_upload():
                 raw_df.columns = [" ".join(str(c).replace("\u00a0", " ").split()) for c in raw_df.columns]
                 aliases = {
                     "วันที่": "date", "date": "date", "Date": "date", "วันที่ข้อมูล": "date",
-                    "Upper Rule Curve": "upper_storage", "upper_rule_curve": "upper_storage", "upper_storage": "upper_storage", "ระดับเก็บกักบน": "upper_storage",
-                    "Lower Rule Curve": "lower_storage", "lower_rule_curve": "lower_storage", "lower_storage": "lower_storage", "ระดับเก็บกักล่าง": "lower_storage",
-                    "ความจุที่ (รนส.)": "storage_rns", "ความจุที่ (รนก.)": "storage_rnk",
+                    "URC": "upper_storage", "Upper Rule Curve": "upper_storage", "upper_rule_curve": "upper_storage", "upper_storage": "upper_storage", "ระดับเก็บกักบน": "upper_storage",
+                    "LRC": "lower_storage", "Lower Rule Curve": "lower_storage", "lower_rule_curve": "lower_storage", "lower_storage": "lower_storage", "ระดับเก็บกักล่าง": "lower_storage",
+                    "ความจุที่ (รนส.)": "storage_rns", "ความจุที่ (รนส)": "storage_rns", "ความจุที่ (รนก.)": "storage_rnk", "ความจุที่ (รนก)": "storage_rnk",
                     "upper_level": "upper_level", "ระดับน้ำบน": "upper_level", "Upper Level": "upper_level",
                     "lower_level": "lower_level", "ระดับน้ำล่าง": "lower_level", "Lower Level": "lower_level",
                 }
@@ -500,7 +500,13 @@ def page_upload():
                     raw_df = raw_df.drop(columns=["วันที่"])
                 raw_df = raw_df.rename(columns={c: aliases.get(c, c) for c in raw_df.columns})
                 if "date" not in raw_df.columns:
-                    raise ValueError("ไม่พบคอลัมน์วันที่ (date หรือ วันที่)")
+                    if len(raw_df) in (365, 366) and any(c in raw_df.columns for c in ("upper_storage", "lower_storage")):
+                        # Rule Curve รายวัน 365/366 แถว ไม่มีวันที่: ใช้วันลำดับของปีอ้างอิง
+                        base_year = 2024 if len(raw_df) == 366 else 2025
+                        raw_df["date"] = pd.date_range(f"{base_year}-01-01", periods=len(raw_df), freq="D")
+                        st.info(f"ไฟล์ไม่มีคอลัมน์วันที่: อ่าน {len(raw_df)} แถวเป็น Rule Curve รายวัน เริ่ม 1 มกราคม ตามลำดับแถว")
+                    else:
+                        raise ValueError("ไฟล์ไม่มีวันที่ ต้องมี 365 หรือ 366 แถวสำหรับ Rule Curve รายวัน หรือเพิ่มคอลัมน์ date")
                 raw_df["date"] = pd.to_datetime(raw_df["date"], errors="coerce", dayfirst=True)
                 if raw_df["date"].isna().all():
                     raise ValueError("ไม่สามารถอ่านวันที่ได้ กรุณาตรวจสอบรูปแบบวันที่ในไฟล์")
@@ -684,7 +690,14 @@ def page_dashboard():
     if not rule_curve.empty:
         rc = rule_curve.copy()
         rc["date"] = pd.to_datetime(rc["date"])
-        rc_future = rc[(rc["date"] >= pd.Timestamp(last_date)) & (rc["date"] <= pd.Timestamp(forecast_dates[-1]))]
+        # Rule Curve เป็นเกณฑ์รายวันวนซ้ำทุกปี: จับคู่เดือน-วันแทนการเทียบปีต้นฉบับ
+        target_dates = pd.date_range(pd.Timestamp(hist.index.min()).normalize(), pd.Timestamp(forecast_dates[-1]).normalize(), freq="D")
+        rc["month_day"] = rc["date"].dt.strftime("%m-%d")
+        rc_by_day = rc.drop_duplicates("month_day", keep="last").set_index("month_day")
+        rc_future = pd.DataFrame({"date": target_dates})
+        for rc_col in ["upper_storage", "lower_storage"]:
+            if rc_col in rc_by_day.columns:
+                rc_future[rc_col] = [rc_by_day[rc_col].get(d.strftime("%m-%d"), rc_by_day[rc_col].get("02-28") if d.strftime("%m-%d") == "02-29" else float("nan")) for d in target_dates]
         for col, label, color in [("upper_storage", "Upper Rule Curve (ล้าน ลบ.ม.)", "#9467bd"), ("lower_storage", "Lower Rule Curve (ล้าน ลบ.ม.)", "#2ca02c")]:
             if col in rc_future.columns and rc_future[col].notna().any():
                 fig.add_trace(go.Scatter(x=rc_future["date"], y=rc_future[col], mode="lines+markers", name=label, line=dict(color=color, dash="dot")))
@@ -736,8 +749,8 @@ def page_dashboard():
     st.dataframe(table_df, use_container_width=True, hide_index=True)
 
     st.info(
-        "หมายเหตุ: ไม่มีเส้น Upper Rule Curve เพราะไม่มีข้อมูลเกณฑ์ปฏิบัติการอ่างของเขื่อนสิริกิติ์ในระบบ "
-        "และปริมาณน้ำในอ่างคาดการณ์คำนวณจากสมดุลน้ำอย่างง่าย (น้ำเดิม + ไหลเข้าคาดการณ์ - ระบายตามสมมติฐานด้านบน) "
+        "หมายเหตุ: เส้น Rule Curve จะแสดงเมื่ออัปโหลดข้อมูลเกณฑ์อ่างแล้ว "
+        "ปริมาณน้ำในอ่างคาดการณ์คำนวณจากสมดุลน้ำอย่างง่าย (น้ำเดิม + ไหลเข้าคาดการณ์ - แผนระบายรายวัน) "
         "ไม่ใช่ผลจากโมเดล ML โดยตรง หากปริมาณระบายจริงเปลี่ยนไปจากที่ตั้งไว้ ตัวเลขนี้จะคลาดเคลื่อน"
     )
 
@@ -745,7 +758,7 @@ def page_dashboard():
     st.subheader("📥 รายงานสรุป (ดาวน์โหลดเป็นรูปภาพ)")
 
     summary_text = report_module.build_summary_text(
-        "เขื่อนสิริกิติ์", last_date, last_storage, capacity, forecast_dates, preds, assumed_release, storage_forecast
+        "เขื่อนสิริกิติ์", last_date, last_storage, capacity, forecast_dates, preds, release_schedule, storage_forecast
     )
     if is_adjusted:
         summary_text += "\n(หมายเหตุ: ค่าไหลลงอ่างรวมนี้ปรับ Baseflow เพิ่มโดยผู้ดูแลระบบแล้ว)"
