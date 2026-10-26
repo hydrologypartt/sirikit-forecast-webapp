@@ -5,6 +5,7 @@ report.py
 """
 import io
 import os
+import datetime
 import matplotlib
 
 matplotlib.use("Agg")
@@ -15,8 +16,17 @@ from matplotlib import font_manager
 
 THAI_FONT_CANDIDATES = [
     "Tahoma", "Leelawadee UI", "TH Sarabun New", "Angsana New",
-    "Noto Sans Thai", "Loma", "Norasi",
+    "Noto Sans Thai", "Noto Looped Thai", "Noto Serif Thai", "Loma", "Norasi", "Garuda", "Kinnari",
 ]
+
+THAI_MONTHS = ("มกราคม", "กุมภาพันธ์", "มีนาคม", "เมษายน", "พฤษภาคม", "มิถุนายน", "กรกฎาคม", "สิงหาคม", "กันยายน", "ตุลาคม", "พฤศจิกายน", "ธันวาคม")
+THAI_MONTHS_SHORT = ("ม.ค.", "ก.พ.", "มี.ค.", "เม.ย.", "พ.ค.", "มิ.ย.", "ก.ค.", "ส.ค.", "ก.ย.", "ต.ค.", "พ.ย.", "ธ.ค.")
+
+def thai_date(value, short=False, include_year=True):
+    d = value.date() if hasattr(value, "date") else value
+    months = THAI_MONTHS_SHORT if short else THAI_MONTHS
+    result = f"{d.day} {months[d.month - 1]}"
+    return f"{result} {d.year + 543}" if include_year else result
 
 LOGO_PATH = os.path.join(os.path.dirname(__file__), "assets", "rid_logo.png")
 
@@ -24,6 +34,8 @@ LOGO_PATH = os.path.join(os.path.dirname(__file__), "assets", "rid_logo.png")
 def _set_thai_font():
     """ลองหาฟอนต์ที่รองรับภาษาไทยในเครื่อง ถ้าไม่เจอเลยจะใช้ฟอนต์ default
     (ภาษาไทยในภาพอาจกลายเป็นสี่เหลี่ยมถ้าเครื่องไม่มีฟอนต์ไทยติดตั้งไว้)"""
+    # Rebuild font cache to recognize Thai fonts installed via packages.txt on Streamlit Cloud.
+    font_manager.fontManager = font_manager.FontManager()
     available = {f.name for f in font_manager.fontManager.ttflist}
     for name in THAI_FONT_CANDIDATES:
         if name in available:
@@ -44,9 +56,9 @@ def build_summary_text(dam_name, last_date, last_storage, capacity, forecast_dat
     pct_end = end_storage / capacity * 100
     remain_end = capacity - end_storage
 
-    d0 = last_date.strftime("%d %b %Y")
-    d_start = forecast_dates[0].strftime("%d %b")
-    d_end = forecast_dates[-1].strftime("%d %b %Y")
+    d0 = thai_date(last_date)
+    d_start = thai_date(forecast_dates[0], include_year=False)
+    d_end = thai_date(forecast_dates[-1])
 
     return (
         f"สถานการณ์ปัจจุบัน วันที่ {d0} มีปริมาณน้ำในอ่างฯ {last_storage:,.2f} ล้าน ลบ.ม. "
@@ -98,7 +110,8 @@ def generate_report_image(dam_name, hist, forecast_dates, preds, storage_forecas
     ax1.set_ylabel("ปริมาณน้ำในอ่าง (ล้าน ลบ.ม.)")
     ax1.set_ylim(bottom=0)
     ax1.set_title(f"กราฟแสดงปริมาณน้ำในอ่างเก็บน้ำ{dam_name}", fontsize=15, pad=14)
-    ax1.xaxis.set_major_formatter(mdates.DateFormatter("%d %b"))
+    from matplotlib.ticker import FuncFormatter
+    ax1.xaxis.set_major_formatter(FuncFormatter(lambda x, pos: thai_date(mdates.num2date(x), short=True, include_year=False)))
     ax1.grid(axis="y", linestyle=":", alpha=0.4)
     fig.autofmt_xdate(rotation=45)
 

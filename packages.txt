@@ -1,0 +1,2 @@
+fonts-thai-tlwg
+fonts-noto-core
