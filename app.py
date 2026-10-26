@@ -1,5 +1,5 @@
 """
-app.py — เว็บพยากรณ์น้ำไหลเข้าเขื่อนสิริกิติ์ล่วงหน้า 7 วัน
+app.py — เว็บพยากรณ์น้ำไหลเข้าอ่างเก็บน้ำเขื่อนสิริกิติ์ล่วงหน้า 7 วัน
 รันด้วย: streamlit run app.py
 """
 import datetime
@@ -106,8 +106,6 @@ def build_model_ready_df():
 # ---------------------------------------------------------------------------
 def page_forecast():
     st.header("พยากรณ์น้ำไหลเข้าอ่าง 7 วันล่วงหน้า")
-    if not _require_login():
-        return
 
     df = build_model_ready_df()
     if df is None or len(df) < 60:
@@ -473,6 +471,57 @@ def page_upload():
             except Exception as e:
                 st.error(f"นำเข้าไม่สำเร็จ: {e}")
 
+    with st.expander("📈 อัปโหลด Rule Curve / เกณฑ์ระดับน้ำอ่าง"):
+        st.caption(
+            "รองรับ CSV และ Excel ตามหัวตาราง: วันที่, date, ความจุที่ (รนส.), ความจุที่ (รนก.), "
+            "Upper Rule Curve, Lower Rule Curve — ค่าปริมาตรมีหน่วยล้าน ลบ.ม. "
+            "หากมีทั้ง วันที่ และ date จะใช้ date เป็นหลัก โดยเก็บค่าความจุทั้งสองคอลัมน์ไว้ในข้อมูล Rule Curve ด้วย"
+        )
+        rc_file = st.file_uploader("ไฟล์ Rule Curve (.xlsx หรือ .csv)", type=["xlsx", "csv"], key="rule_curve_uploader")
+        current_rc = data_io.load_rule_curve()
+        if not current_rc.empty:
+            st.success(f"มี Rule Curve ในระบบแล้ว {len(current_rc)} แถว ({current_rc['date'].min().date()} ถึง {current_rc['date'].max().date()}) — อัปโหลดใหม่เพื่อแทนที่ได้")
+        if rc_file is not None and st.button("บันทึก Rule Curve", key="save_rule_curve_btn"):
+            try:
+                raw = rc_file.read()
+                raw_df = pd.read_excel(io.BytesIO(raw)) if rc_file.name.lower().endswith(".xlsx") else pd.read_csv(io.BytesIO(raw), encoding="utf-8-sig")
+                raw_df.columns = [" ".join(str(c).replace("\u00a0", " ").split()) for c in raw_df.columns]
+                aliases = {
+                    "วันที่": "date", "date": "date", "Date": "date", "วันที่ข้อมูล": "date",
+                    "Upper Rule Curve": "upper_storage", "upper_rule_curve": "upper_storage", "upper_storage": "upper_storage", "ระดับเก็บกักบน": "upper_storage",
+                    "Lower Rule Curve": "lower_storage", "lower_rule_curve": "lower_storage", "lower_storage": "lower_storage", "ระดับเก็บกักล่าง": "lower_storage",
+                    "ความจุที่ (รนส.)": "storage_rns", "ความจุที่ (รนก.)": "storage_rnk",
+                    "upper_level": "upper_level", "ระดับน้ำบน": "upper_level", "Upper Level": "upper_level",
+                    "lower_level": "lower_level", "ระดับน้ำล่าง": "lower_level", "Lower Level": "lower_level",
+                }
+                # date เป็นวันที่หลัก หากคอลัมน์นี้ไม่มีค่าในบางแถวให้ใช้ วันที่ สำรอง
+                if "date" in raw_df.columns and "วันที่" in raw_df.columns:
+                    raw_df["date"] = raw_df["date"].where(raw_df["date"].notna(), raw_df["วันที่"])
+                    raw_df = raw_df.drop(columns=["วันที่"])
+                raw_df = raw_df.rename(columns={c: aliases.get(c, c) for c in raw_df.columns})
+                if "date" not in raw_df.columns:
+                    raise ValueError("ไม่พบคอลัมน์วันที่ (date หรือ วันที่)")
+                raw_df["date"] = pd.to_datetime(raw_df["date"], errors="coerce", dayfirst=True)
+                if raw_df["date"].isna().all():
+                    raise ValueError("ไม่สามารถอ่านวันที่ได้ กรุณาตรวจสอบรูปแบบวันที่ในไฟล์")
+                numeric_cols = ["upper_storage", "lower_storage", "upper_level", "lower_level", "storage_rns", "storage_rnk"]
+                for col in numeric_cols:
+                    if col in raw_df.columns:
+                        raw_df[col] = pd.to_numeric(raw_df[col].astype(str).str.replace(",", "", regex=False), errors="coerce")
+                if not any(c in raw_df.columns and raw_df[c].notna().any() for c in ["upper_storage", "lower_storage"]):
+                    raise ValueError("ไม่พบตัวเลขใน Upper Rule Curve หรือ Lower Rule Curve")
+                available = [c for c in numeric_cols if c in raw_df.columns]
+                clean = raw_df[["date"] + available].dropna(subset=["date"]).drop_duplicates("date", keep="last").sort_values("date")
+                for col in numeric_cols:
+                    if col not in clean.columns:
+                        clean[col] = float("nan")
+                data_io.save_rule_curve(clean[["date"] + numeric_cols])
+                st.cache_data.clear()
+                st.success(f"บันทึก Rule Curve สำเร็จ {len(clean)} แถว")
+                st.dataframe(clean, use_container_width=True, hide_index=True)
+            except Exception as e:
+                st.error(f"บันทึก Rule Curve ไม่สำเร็จ: {e}")
+
     with st.expander("📁 อัปโหลดขอบเขตพื้นที่รับน้ำ / shapefile (ทำครั้งเดียวตอน setup เท่านั้น)"):
         st.caption(
             "ใช้ตัดพื้นที่รับน้ำสำหรับคำนวณฝนเฉลี่ยพื้นที่จากไฟล์กริดฝนพยากรณ์ (d01/d02) — ไม่ต้องอัปโหลดซ้ำทุกวัน "
@@ -547,8 +596,6 @@ def page_dashboard():
     import plotly.graph_objects as go
 
     st.header("กราฟสรุปปริมาณน้ำในอ่าง: ย้อนหลัง + คาดการณ์ 7 วัน")
-    if not _require_login():
-        return
 
     df = build_model_ready_df()
     if df is None or len(df) < 60:
@@ -595,17 +642,20 @@ def page_dashboard():
     hist = df.loc[last_date - datetime.timedelta(days=lookback_days - 1):last_date]
 
     recent_release_avg = float(df["release"].tail(7).mean())
-    assumed_release = st.number_input(
-        "สมมติฐานปริมาณน้ำระบายต่อวันช่วงคาดการณ์ (ล้าน ลบ.ม./วัน) — ค่าเริ่มต้นคือเฉลี่ย 7 วันล่าสุดที่มีจริง",
-        min_value=0.0, value=round(recent_release_avg, 2), step=0.5,
-    )
+    saved_plan = data_io.load_release_plan()
+    release_map = {r["date"].date(): float(r["release_mcm"]) for _, r in saved_plan.iterrows() if pd.notna(r["date"])} if not saved_plan.empty else {}
+    release_values = [release_map.get(d.date(), round(recent_release_avg, 2)) for d in forecast_dates]
+    release_df = pd.DataFrame({"วันที่": forecast_dates, "แผนระบาย (ล้าน ลบ.ม./วัน)": release_values})
+    st.caption("สมดุลน้ำใช้แผนระบายแยกแต่ละวันจากหลังบ้าน หากไม่มีแผนสำหรับวันนั้นจะใช้ค่าเฉลี่ยระบายจริง 7 วันล่าสุด")
+    st.dataframe(release_df.assign(วันที่=release_df["วันที่"].dt.strftime("%d/%m/%Y")), use_container_width=True, hide_index=True)
+    release_schedule = [float(v) for v in release_values]
 
     capacity = float(df["capacity"].iloc[-1])
     last_storage = float(df["storage"].iloc[-1])
     storage_forecast = []
     running = last_storage
-    for p in preds:
-        running = running + p - assumed_release
+    for p, rel in zip(preds, release_schedule):
+        running = running + p - rel
         storage_forecast.append(running)
 
     # ฝนสำหรับแสดงผล (ถ้ามี) — ไม่จำเป็นต้องเป็นตัวเดียวกับที่ใช้รันโมเดล เอาไว้ดูประกอบกราฟ
@@ -630,6 +680,14 @@ def page_dashboard():
         x=[hist.index.min(), forecast_dates[-1]], y=[capacity, capacity], mode="lines",
         name=f"ความจุเก็บกัก ({capacity:,.2f} ล้าน ลบ.ม.)", line=dict(color="#d62728", dash="dot"),
     ))
+    rule_curve = data_io.load_rule_curve()
+    if not rule_curve.empty:
+        rc = rule_curve.copy()
+        rc["date"] = pd.to_datetime(rc["date"])
+        rc_future = rc[(rc["date"] >= pd.Timestamp(last_date)) & (rc["date"] <= pd.Timestamp(forecast_dates[-1]))]
+        for col, label, color in [("upper_storage", "Upper Rule Curve (ล้าน ลบ.ม.)", "#9467bd"), ("lower_storage", "Lower Rule Curve (ล้าน ลบ.ม.)", "#2ca02c")]:
+            if col in rc_future.columns and rc_future[col].notna().any():
+                fig.add_trace(go.Scatter(x=rc_future["date"], y=rc_future[col], mode="lines+markers", name=label, line=dict(color=color, dash="dot")))
     if not rain_hist.dropna().empty:
         fig.add_trace(go.Bar(
             x=rain_hist.index, y=rain_hist.values, name="ฝนจริงเฉลี่ย (มม.)",
@@ -650,12 +708,29 @@ def page_dashboard():
     )
     st.plotly_chart(fig, use_container_width=True)
 
+    # กราฟระดับน้ำ (ม.รทก.) แยกจากกราฟปริมาตร เพื่อไม่ปะปนหน่วย
+    rule_curve = data_io.load_rule_curve()
+    if not rule_curve.empty and any(c in rule_curve.columns and rule_curve[c].notna().any() for c in ["upper_level", "lower_level"]):
+        fig_level = go.Figure()
+        fig_level.add_trace(go.Scatter(x=hist.index, y=hist["level"], mode="lines+markers", name="ระดับน้ำจริง (ม.รทก.)", line=dict(color="#1f77b4")))
+        # ระดับน้ำคาดการณ์ไม่สามารถอนุมานจากปริมาตรได้โดยไม่มีตารางแปลงระดับ-ปริมาตร จึงแสดง Rule Curve เท่านั้น
+        rc_level = rule_curve.copy()
+        rc_level["date"] = pd.to_datetime(rc_level["date"])
+        rc_level = rc_level[(rc_level["date"] >= hist.index.min()) & (rc_level["date"] <= pd.Timestamp(forecast_dates[-1]))]
+        for col, label, color in [("upper_level", "Upper Rule Curve (ม.รทก.)", "#9467bd"), ("lower_level", "Lower Rule Curve (ม.รทก.)", "#2ca02c")]:
+            if col in rc_level.columns and rc_level[col].notna().any():
+                fig_level.add_trace(go.Scatter(x=rc_level["date"], y=rc_level[col], mode="lines+markers", name=label, line=dict(color=color, dash="dot")))
+        fig_level.update_layout(title="ระดับน้ำจริงเทียบกับ Rule Curve (ม.รทก.)", yaxis_title="ระดับน้ำ (ม.รทก.)", hovermode="x unified", margin=dict(t=45))
+        st.plotly_chart(fig_level, use_container_width=True)
+        st.caption("ระดับน้ำคาดการณ์ยังไม่แสดง: ต้องมีตารางแปลงปริมาตรน้ำเป็นระดับน้ำสำหรับการคำนวณที่ถูกต้อง")
+
     table_cols = {"วันที่": [d.strftime("%d/%m/%Y") for d in forecast_dates]}
     if is_adjusted:
         table_cols["ผลโมเดลก่อนปรับ (ล้าน ลบ.ม./วัน)"] = [round(p, 2) for p in preds_model]
         table_cols["ปรับ Baseflow (ล้าน ลบ.ม./วัน)"] = [round(a, 2) for a in adj_mcm]
     table_cols["ไหลลงอ่างคาดการณ์ (ล้าน ลบ.ม./วัน)"] = [round(p, 2) for p in preds]
     table_cols["ฝนคาดการณ์ (มม.)"] = [round(v, 2) if v is not None else None for v in (rain_fc_display or [None] * 7)]
+    table_cols["แผนระบาย (ล้าน ลบ.ม./วัน)"] = [round(v, 2) for v in release_schedule]
     table_cols["ปริมาณน้ำในอ่างคาดการณ์ (ล้าน ลบ.ม.)"] = [round(s, 2) for s in storage_forecast]
     table_df = pd.DataFrame(table_cols)
     st.dataframe(table_df, use_container_width=True, hide_index=True)
@@ -706,48 +781,6 @@ BF_COL_NOTE = "หมายเหตุ"
 BF_WARN_CMS = 300  # เตือนถ้าค่าปรับต่อวันเกินนี้ (ลบ.ม./วิ) — กันกรอกผิดหน่วย
 
 
-def render_login_box():
-    """ช่องเข้าสู่ระบบกลางของทั้งแอป (แสดงบนสุดของหน้า ก่อนแท็บ) — ต้องล็อกอินก่อนรันโมเดล"""
-    if baseflow_module.is_logged_in():
-        role_th = "ผู้ดูแล" if baseflow_module.is_admin() else "ผู้ใช้"
-        c1, c2 = st.columns([6, 1])
-        c1.success(f"🔐 เข้าสู่ระบบเป็น {baseflow_module.current_user()} ({role_th})")
-        if c2.button("ออกจากระบบ", use_container_width=True):
-            baseflow_module.logout()
-            st.rerun()
-        return
-    if not baseflow_module.accounts_configured():
-        st.warning(
-            "ยังไม่ได้ตั้งบัญชีผู้ใช้ — ไปที่ App settings → Secrets แล้วเพิ่มหัวข้อ `[users]` และ/หรือ `[admin_users]` "
-            "(ดูตัวอย่างใน README) ระบบจึงจะอนุญาตให้รันโมเดลได้"
-        )
-        return
-    with st.expander("🔐 เข้าสู่ระบบ (ต้องเข้าสู่ระบบก่อนจึงจะรันโมเดลได้)", expanded=True):
-        if baseflow_module.login_locked():
-            st.error("ใส่รหัสผ่านผิดเกินจำนวนครั้งที่กำหนด — รีเฟรชหน้าเว็บแล้วลองใหม่")
-            return
-        with st.form("login_form"):
-            u = st.text_input("ชื่อผู้ใช้")
-            pw = st.text_input("รหัสผ่าน", type="password")
-            submitted = st.form_submit_button("เข้าสู่ระบบ", type="primary")
-        if submitted:
-            if baseflow_module.login(u, pw):
-                st.rerun()
-            else:
-                st.error("ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง")
-
-
-def _require_login() -> bool:
-    """ใช้ต้นหน้าที่รันโมเดล: คืน True ถ้าล็อกอินแล้ว ไม่งั้นแสดงข้อความและคืน False"""
-    if baseflow_module.is_logged_in():
-        return True
-    if not baseflow_module.accounts_configured():
-        st.warning("ยังไม่ได้ตั้งบัญชีผู้ใช้ในระบบ จึงยังรันโมเดลไม่ได้ — ดูวิธีตั้งค่าใน README")
-    else:
-        st.info("🔐 ต้องเข้าสู่ระบบก่อนจึงจะรันโมเดลได้ — เข้าสู่ระบบที่ช่องบนสุดของหน้า")
-    return False
-
-
 def _preview_model_preds(forecast_dates):
     """รันโมเดลปัจจุบันเพื่อแสดงตัวอย่างก่อน/หลังปรับ คืน (preds, error_message)"""
     df = build_model_ready_df()
@@ -774,167 +807,15 @@ def _preview_model_preds(forecast_dates):
     return preds, None
 
 
-def page_admin():
-    st.header("🔧 หลังบ้าน: ปรับค่า Baseflow รายวัน")
-    user = baseflow_module.current_admin()
-    if not user:
-        if baseflow_module.is_logged_in():
-            st.warning("บัญชีนี้เป็นผู้ใช้ทั่วไป — หน้านี้ต้องใช้บัญชีผู้ดูแล (แอดมิน) เท่านั้น")
-        else:
-            st.info("🔐 หน้านี้สำหรับผู้ดูแลระบบ — เข้าสู่ระบบด้วยบัญชีแอดมินที่ช่องบนสุดของหน้า")
-        return
-
-    st.caption(
-        "ค่าที่กรอกคือ **ปริมาณน้ำที่บวกเพิ่ม** จากผลโมเดลในแต่ละวัน หน่วย ลบ.ม./วินาที (cms) "
-        "ระบบแปลงเป็น ล้าน ลบ.ม./วัน ให้เอง (1 cms = 0.0864 ล้าน ลบ.ม./วัน) "
-        "ใส่ค่าลบได้ถ้าต้องการลด และผลรวมต่อวันจะไม่ต่ำกว่า 0"
-    )
-
-    df = build_model_ready_df()
-    if df is None or df.empty:
-        st.warning("ยังไม่มีข้อมูลอ่างในระบบ — ใช้วันที่ตั้งแต่พรุ่งนี้เป็นฐานแทนไปก่อน")
-        last_date = pd.Timestamp.today().normalize()
-    else:
-        last_date = df.index.max()
-    forecast_dates = [last_date + datetime.timedelta(days=i) for i in range(1, 8)]
-    st.caption(
-        f"ข้อมูลล่าสุด {last_date.strftime('%d/%m/%Y')} → ปรับได้ {forecast_dates[0].strftime('%d/%m/%Y')} "
-        f"ถึง {forecast_dates[-1].strftime('%d/%m/%Y')}"
-    )
-
-    saved = data_io.load_baseflow_adjustments()
-    saved_map = {}
-    for _, r in saved.iterrows():
-        note = "" if pd.isna(r["note"]) else str(r["note"])
-        saved_map[r["date"].date()] = (float(r["adj_cms"]), note)
-
-    # ตั้งต้นตารางจากค่าที่บันทึกไว้ (ทำใหม่เมื่อวันที่ข้อมูลล่าสุดเปลี่ยน)
-    sig = last_date.strftime("%Y-%m-%d")
-    if "bf_table" not in st.session_state or st.session_state.get("bf_sig") != sig:
-        st.session_state.bf_table = pd.DataFrame({
-            BF_COL_DATE: [d.date() for d in forecast_dates],
-            BF_COL_ADJ: [saved_map.get(d.date(), (0.0, ""))[0] for d in forecast_dates],
-            BF_COL_NOTE: [saved_map.get(d.date(), (0.0, ""))[1] for d in forecast_dates],
-        })
-        st.session_state.bf_sig = sig
-        st.session_state.bf_ver = st.session_state.get("bf_ver", 0) + 1
-
-    # ใช้ form: แก้ตารางได้ต่อเนื่องโดยหน้าไม่รีโหลด จนกว่าจะกด "ดูตัวอย่าง" หรือ "บันทึก"
-    with st.form("bf_form"):
-        edited = st.data_editor(
-            st.session_state.bf_table,
-            use_container_width=True,
-            hide_index=True,
-            num_rows="fixed",
-            column_config={
-                BF_COL_DATE: st.column_config.DateColumn(BF_COL_DATE, format="DD/MM/YYYY", disabled=True),
-                BF_COL_ADJ: st.column_config.NumberColumn(
-                    BF_COL_ADJ, step=0.5, format="%.2f", min_value=-2000.0, max_value=2000.0,
-                    help="ค่าบวก = เพิ่มน้ำไหลลงอ่าง, ค่าลบ = ลด",
-                ),
-                BF_COL_NOTE: st.column_config.TextColumn(BF_COL_NOTE, max_chars=200),
-            },
-            key=f"bf_editor_{st.session_state.bf_ver}",
-        )
-        f1, f2, f3 = st.columns([2, 1, 1])
-        fill_val = f1.number_input("ค่าเดียวกันทุกวัน (ลบ.ม./วิ)", value=0.0, step=1.0)
-        fill_clicked = f2.form_submit_button("ใส่ค่านี้ทุกวัน", use_container_width=True)
-        zero_clicked = f3.form_submit_button("ล้างเป็น 0", use_container_width=True)
-        g1, g2 = st.columns(2)
-        preview_clicked = g1.form_submit_button("👁️ ดูตัวอย่างผลหลังปรับ", use_container_width=True)
-        save_clicked = g2.form_submit_button("💾 บันทึกค่าปรับ", type="primary", use_container_width=True)
-
-    if fill_clicked or zero_clicked:
-        new_tbl = edited.copy()  # คงหมายเหตุที่พิมพ์ไว้
-        new_tbl[BF_COL_ADJ] = float(fill_val) if fill_clicked else 0.0
-        st.session_state.bf_table = new_tbl
-        st.session_state.bf_ver += 1
-        st.rerun()
-
-    adj_cms = pd.to_numeric(edited[BF_COL_ADJ], errors="coerce").fillna(0.0)
-    notes = edited[BF_COL_NOTE].fillna("").astype(str)
-    adj_edit_map = {d.date(): float(v) for d, v in zip(forecast_dates, adj_cms)}
-
-    if (adj_cms.abs() > BF_WARN_CMS).any():
-        st.warning(f"มีค่าปรับเกิน {BF_WARN_CMS} ลบ.ม./วิ ต่อวัน — ตรวจสอบหน่วยอีกครั้งก่อนบันทึก")
-
-    # ---- ตัวอย่างผลก่อน/หลังปรับ (แสดงเมื่อกดดูตัวอย่างหรือบันทึก) ----
-    if preview_clicked or save_clicked:
-        st.subheader("ตัวอย่างผลหลังปรับ")
-        adj_mcm_edit = [adj_edit_map[d.date()] * 86400 / 1_000_000 for d in forecast_dates]
-        labels = [d.strftime("%d/%m/%Y") for d in forecast_dates]
-        preds, err = _preview_model_preds(forecast_dates)
-        if preds is None:
-            st.info(f"แสดงตัวอย่างผลพยากรณ์ไม่ได้: {err} — แต่ยังบันทึกค่าปรับไว้ล่วงหน้าได้")
-            st.dataframe(
-                pd.DataFrame({"วันที่": labels, "ปรับเพิ่ม (ลบ.ม./วิ)": list(adj_cms), "เทียบเท่า (ล้าน ลบ.ม./วัน)": [round(a, 3) for a in adj_mcm_edit]}),
-                use_container_width=True, hide_index=True,
-            )
-        else:
-            preds_adj, _ = baseflow_module.apply_adjustment(preds, forecast_dates, adj_edit_map)
-            prev = pd.DataFrame({
-                "วันที่": labels,
-                "ผลโมเดล (ล้าน ลบ.ม./วัน)": preds,
-                "ปรับเพิ่ม (ลบ.ม./วิ)": list(adj_cms),
-                "เทียบเท่า (ล้าน ลบ.ม./วัน)": adj_mcm_edit,
-                "หลังปรับ (ล้าน ลบ.ม./วัน)": preds_adj,
-            })
-            st.line_chart(prev.set_index("วันที่")[["ผลโมเดล (ล้าน ลบ.ม./วัน)", "หลังปรับ (ล้าน ลบ.ม./วัน)"]])
-            st.dataframe(prev.round(2), use_container_width=True, hide_index=True)
-
-    # ---- บันทึก (เมื่อกดปุ่มบันทึกเท่านั้น) ----
-    if save_clicked:
-        try:
-            now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            new_rows = pd.DataFrame({
-                "date": forecast_dates,
-                "adj_cms": list(adj_cms),
-                "note": list(notes),
-                "updated_by": user,
-                "updated_at": now,
-            })
-            edited_dates = {d.date() for d in forecast_dates}
-            frames = []
-            if not saved.empty:
-                frames.append(saved[~saved["date"].dt.date.isin(edited_dates)])
-            nonzero = new_rows[new_rows["adj_cms"].abs() > 1e-9]
-            if not nonzero.empty:
-                frames.append(nonzero)
-            merged = (
-                pd.concat(frames, ignore_index=True).sort_values("date")
-                if frames else pd.DataFrame(columns=data_io.BASEFLOW_COLS)
-            )
-            data_io.save_baseflow_adjustments(merged)
-            data_io.save_baseflow_audit(new_rows)  # บันทึกทุกวันที่แก้ รวมวันที่ตั้งเป็น 0 ไว้ใน audit
-            st.cache_data.clear()
-            st.success(f"บันทึกค่าปรับ Baseflow เรียบร้อย (มีผลทันทีที่หน้าพยากรณ์และกราฟสรุป) — {len(nonzero)} วันที่มีค่าปรับ")
-        except Exception as e:
-            st.error(f"บันทึกไม่สำเร็จ: {e}")
-
-    st.divider()
-    with st.expander("📜 ประวัติการแก้ไข (ใครปรับอะไรเมื่อไหร่)"):
-        audit = data_io.load_baseflow_audit()
-        if audit.empty:
-            st.info("ยังไม่มีประวัติ")
-        else:
-            show = audit.rename(columns={
-                "date": "วันที่ที่ปรับ", "adj_cms": "ปรับ (ลบ.ม./วิ)", "note": "หมายเหตุ",
-                "updated_by": "ผู้แก้ไข", "updated_at": "เวลาที่บันทึก",
-            })
-            st.dataframe(show, use_container_width=True, hide_index=True)
-
-
 # ---------------------------------------------------------------------------
-st.title("🌊 ระบบพยากรณ์น้ำไหลเข้าเขื่อนสิริกิติ์")
+st.title("🌊 ระบบพยากรณ์น้ำไหลเข้าอ่างเก็บน้ำเขื่อนสิริกิติ์")
 
 if data_io.storage_mode() == "local":
     st.sidebar.warning("⚠️ กำลังใช้ local storage (ยังไม่ได้ตั้งค่า Google Drive) — ข้อมูลจะหายถ้า deploy ใหม่")
 else:
     st.sidebar.success("✅ เชื่อมต่อ Google Drive แล้ว")
 
-render_login_box()
-
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["📈 พยากรณ์", "📤 อัปโหลดข้อมูลใหม่", "🗂️ ประวัติ", "📊 กราฟสรุป", "🔧 หลังบ้าน (Baseflow)"])
+tab1, tab2, tab3, tab4 = st.tabs(["📈 พยากรณ์", "📤 อัปโหลดข้อมูลใหม่", "🗂️ ประวัติ", "📊 กราฟสรุป"])
 with tab1:
     page_forecast()
 with tab2:
@@ -943,5 +824,3 @@ with tab3:
     page_history()
 with tab4:
     page_dashboard()
-with tab5:
-    page_admin()
